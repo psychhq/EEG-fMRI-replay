@@ -1,0 +1,2796 @@
+## Decoding on slow trials
+
+### Initialization
+
+We load the data and relevant functions:
+
+```{r, warning=FALSE, message=FALSE, echo=TRUE}
+# find the path to the root of this project:
+setwd('/home/huangqi/Data/BIDS')
+path_root=getwd()
+source(file.path(path_root,'code','sinusoidal_response_model',"highspeed-analysis-source.R"))
+path_figures <- file.path(path_root, 'derivatives','sinusoidal_response_model', "figures")
+path_sourcedata <- file.path(path_root, "sourcedata",'sinusoidal_response_model')
+# create a list of participants to exclude based on behavioral performance:
+sub_excludes <- c("sub-01", "sub-05", "sub-06", "sub-10",
+                 "sub-12", "sub-14", "sub-16", "sub-17",
+                 "sub-22", "sub-23", "sub-29", "sub-35",
+                 "sub-37", "sub-39", "sub-43", "sub-46")
+sub_exclude <- c(1,5,6,10,12,14,16,17,22,23,29,35,37,39,43,46)
+color_events <- rev(hcl.colors(5, "Zissou 1"))
+```
+
+
+```{r}
+# 'emmeans' is not support by linux
+
+packages = c("plyr",'dplyr','ggplot2',"assertr","data.table",
+             'lemon','lmerTest','ggpubr',"rstatix","broom",
+             'forcats','nloptr','cowplot','viridis','data.table',
+             'stringr')
+load_packages(packages_list = packages)
+
+```
+
+
+### Load the data
+
+```{r,echo=True}
+
+dt_VFL <- read.csv(file.path(
+  path_root,'derivatives','decoding','all_subject_results','VFL_decoding','VFL_decoding.csv'
+  ),sep = ",", as.is = TRUE, stringsAsFactors = FALSE, header=TRUE)
+dt_replay <- read.csv(file.path(
+  path_root,'derivatives','decoding','all_subject_results','replay_decoding','replay_decoding.csv'
+  ),sep = ",", as.is = TRUE, stringsAsFactors = FALSE, header=TRUE)
+dt_VFL$marker <- NaN
+dt_prob <- rbind(dt_VFL,dt_replay)
+replay_sequences <- read.csv(file.path(path_root,'sourcedata','sequence.csv'),sep = ",")
+
+```
+
+### Fold-wise decoding accuracy
+
+We calculate the mean decoding accuracy for each of the eight folds of the cross-validation procedure:
+
+```{r, results="hold", echo=TRUE}
+dt_VFL_peak_run = dt_prob %>%
+  # leave out the redundant "other" class predictions:
+  filter(test_set == "test-VFL_peak" & class != "other" & mask == "mask_vis_mtl") %>%
+  # filter out excluded participants:
+  # filter(!(id %in% sub_exclude)) %>%
+  setDT(.) %>%
+  # calculate average decoding accuracy for every participant and classification:
+  .[, by = .(participant, run, trials, stim), .(
+    max_prob_label = class[which.max(probability)],
+    num_classes = .N
+  )] %>%
+  # check if there are five classifier predictions per trial:
+  verify(num_classes == 4) %>%
+  # determine accuracy if label with highest probability matches stimulus:
+  .[, "accuracy" := ifelse(stim == max_prob_label, 1, 0)]
+# print results table:
+rmarkdown::paged_table(dt_VFL_peak_run)
+```
+
+```{r, results="hold", echo=TRUE}
+# calculate average decoding accuracy for every participant and classification:
+dt_VFL_peak_run_mean <- dt_VFL_peak_run %>%
+  .[, by = .(participant, run), .(
+    mean_accuracy = mean(accuracy) * 100,
+    num_trials = length(unique(trials))
+  )] %>%
+  setorder(., participant, run)
+# print the table:
+rmarkdown::paged_table(dt_VFL_peak_run_mean)
+```
+
+
+```{r, echo=FALSE, class.source=NULL}
+fig_VFL_run =
+ggplot(data = subset(dt_VFL_peak_run_mean), aes(
+  x = run, y = as.numeric(mean_accuracy))) +
+  geom_bar(stat = "summary", fun = "mean", fill = "lightgray", color = "black") +
+  geom_errorbar(stat = "summary", fun.data = "mean_se", width = 0.0, color = "black") +
+  ylab("Accuracy (%)") + xlab("Task run") +
+  geom_hline(aes(yintercept = 25), linetype = "dashed", color = "black") +
+  scale_y_continuous(labels = label_fill(seq(0, 100, 25), mod = 1), breaks = seq(0, 100, 25)) +
+  # coord_capped_cart(left = "both", expand = TRUE, ylim = c(0, 100)) +
+  annotate("text", x = 4, y = 28, label = "Chance", color = "black",
+           size = rel(2.5), fontface = "plain") +
+  theme(legend.position = "none") +
+  theme(panel.border = element_blank()) +
+  theme(axis.text = element_text(color = "black")) +
+  theme(axis.ticks = element_line(color = "black")) +
+  theme(axis.line.y = element_line(colour = "black"),
+        axis.ticks.x = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank())
+fig_VFL_run
+```
+
+```{r, include=FALSE, eval=FALSE, echo=FALSE}
+ggsave(filename = "highspeed_plot_decoding_average_decoding_run.pdf",
+       plot = fig_VFL_run, path = path_figures, scale = 1,
+       dpi = "retina", height = 3, width = 5)
+```
+
+```{r, results="hold"}
+lcctrl <- lmerControl(
+        optimizer = c("bobyqa"), optCtrl = list(maxfun = 500000),
+        calc.derivs = FALSE)
+
+lme_VFL_peak_run <- lmerTest::lmer(
+  mean_accuracy ~ run + (1 | participant), control = lcctrl,
+  data = subset(dt_VFL_peak_run_mean)
+)
+summary(lme_VFL_peak_run)
+anova(lme_VFL_peak_run)
+# no emmeans function in linux
+# emmeans_results = emmeans(lme_VFL_peak_run, list(pairwise ~ run))
+# emmeans_results
+```
+
+## Single-trial decoding time courses
+
+We calculate the multivariate decoding time courses on single slow trials:
+
+```{r, echo=TRUE}
+dt_VFL_long_sub = dt_prob %>%
+  # select data for the oddball long decoding
+  # leave out the redundant "other" class predictions:
+  filter(test_set == "test-VFL_long" & class != "other" & mask == "mask_vis_mtl") %>%
+  # filter out excluded participants:
+  filter(!(participant %in% sub_exclude)) %>%
+  setDT(.) %>%
+  # average across stimuli and runs for each participant
+  # create an index for the true stimulus presented on each trial:
+  .[, by = .(participant, seq_tr, class, stim), .(
+    num = .N,
+    mean_prob = mean(probability * 100),
+    current_stim = as.numeric(class == unique(stim))
+  )]
+
+dt_VFL_long_mean = dt_VFL_long_sub %>% 
+  # average across participants:
+  .[, by = .(seq_tr, class, stim, current_stim), .(
+    mean_prob = mean(mean_prob),
+    num_subs = .N,
+    sem_upper = (mean(mean_prob) + (sd(mean_prob)/sqrt(.N))),
+    sem_lower = (mean(mean_prob) - (sd(mean_prob)/sqrt(.N)))
+  )] %>%
+  # create an additional variable that expresses time in seconds:
+  mutate(time = (seq_tr - 1) * 1.3) %>%
+  # check if the number of participants is correct:
+  verify(all(num_subs == 34))
+```
+
+#### Figure 2b
+
+We plot the single-trial multi-variate decoding time courses on slow trials:
+
+```{r}
+plot.VFL.long = ggplot(data = dt_VFL_long_mean, aes(
+  x = as.factor(seq_tr), y = as.numeric(mean_prob))) +
+  facet_wrap(~ as.factor(stim)) + # devide into four classes
+  geom_line(data = subset(dt_VFL_long_sub,), aes(
+    group = as.factor(interaction(participant, class)), color = fct_rev(as.factor(current_stim))), alpha = 0.0) +
+  geom_line(data = subset(dt_VFL_long_sub, current_stim == 0), aes(
+    group = as.factor(interaction(participant, class)), color = fct_rev(as.factor(current_stim))), alpha = 0.3) +
+  geom_line(data = subset(dt_VFL_long_sub, current_stim == 1), aes(
+    group = as.factor(interaction(participant, class)), color = fct_rev(as.factor(current_stim))), alpha = 0.3) +
+  geom_ribbon(
+    data = subset(dt_VFL_long_mean),
+    aes(ymin = sem_lower, ymax = sem_upper, fill = fct_rev(as.factor(current_stim)),
+        group = as.factor(class)), alpha = 0.0, color = NA) +
+  geom_line(
+    data = subset(dt_VFL_long_mean, alpha = 0),
+    aes(color = fct_rev(as.factor(current_stim)), group = as.factor(class))) +
+  geom_ribbon(
+    data = subset(dt_VFL_long_mean, current_stim == 1),
+    aes(ymin = sem_lower, ymax = sem_upper, fill = fct_rev(as.factor(current_stim)),
+        group = as.factor(class)), alpha = 0.3, color = NA) +
+  geom_line(
+    data = subset(dt_VFL_long_mean, current_stim == 1),
+    aes(color = fct_rev(as.factor(current_stim)), group = as.factor(class))) +
+  ylab("Probability (%)") + xlab("Time from stimulus onset (TRs)") +
+  scale_fill_manual(name = "Classified class", values = c("black", "lightgray"), labels = c("true", "other")) +
+  scale_color_manual(name = "Classified class", values = c("black", "lightgray"), labels = c("true", "other")) +
+  # coord_capped_cart(left = "both", bottom = "both", expand = TRUE, ylim = c(0, 100)) +
+  theme(legend.position = c(1, 0), legend.justification = c(1, 0)) +
+  #theme(legend.position = c(0.95, 0.8), legend.justification = c(1, 0)) +
+  #theme(legend.title = element_text(size = 8), legend.text = element_text(size = 8)) +
+  #theme(legend.key.size = unit(0.7, "line")) +
+  scale_x_discrete(labels = label_fill(seq(0, 7, 1), mod = 1), breaks = seq(0, 7, 1)) +
+  guides(color = guide_legend(ncol = 2), fill = guide_legend(ncol = 2)) +
+  theme(strip.text.x = element_text(margin = margin(b = 2, t = 2))) +
+  theme(panel.border = element_blank(), axis.line = element_line()) +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank())
+#theme(strip.text.x = element_blank())
+plot.VFL.long
+```
+
+```{r, include=FALSE, eval=FALSE, echo=FALSE}
+ggsave(filename = "highspeed_plot_decoding_single_trial_activation.pdf",
+       plot = plot.VFL.long, path = path_figures, scale = 1,
+       dpi = "retina", width = 10.5, height = 9)
+```
+
+## Response functions
+
+### Define response functions
+
+We define the sine wave response function:
+
+```{r}
+sine_truncated <- function(params, time) {
+  if (!is.list(params)) {
+    params = as.list(params)
+    names(params) = c('frequency', 'amplitude', 'shift', 'baseline')
+  }
+  y = rep(0, 13)
+  y = params$amp/2 * sin(2*pi*params$freq*time - 2*pi*params$freq*params$shift - 0.5*pi) + params$baseline + params$amp/2
+  # flatten response function after one cycle:
+  y[time < (params$shift)] = params$baseline
+  y[time > (params$shift + 1/params$freq)] = params$baseline  
+  return(y) 
+}
+```
+
+We define a function to evaluate during optimization:
+
+```{r}
+sine_truncated_eval = function(params, time, data) {
+  y = sine_truncated(params, time)
+  SSE = sum((data - y)^2)
+  return(SSE)
+}
+```
+
+### Mean parameters
+
+We calculate the multivariate decoding time courses for each stimulus class: 
+
+```{r}
+# calculate mean probability for every stimulus for every TR:
+dt_VFL_long_mean_class = dt_prob %>%
+  # filter for oddball long predictions and only select ovr classifier:
+  filter(test_set == "test-VFL_long" & class != "other" &
+            mask == "mask_vis_mtl") %>%
+  # filter out excluded participants:
+  # filter(!(id %in% sub_exclude)) %>%
+  setDT(.) %>%
+  # select only predictions for the class currently shown on any given trial:
+  filter(class == stim) %>%
+  setDT(.) %>%
+  # average the probability across trials
+  .[, by = .(participant, stim, seq_tr), .(
+      `mean_probability` = mean(probability, na.rm = TRUE)
+  )]
+```
+
+We fit the truncated sine wave response function to data from every participant:
+
+```{r}
+# set optimization parameters:
+opts = list("algorithm" = "NLOPT_LN_COBYLA", "xtol_rel" = 1.0e-8, "maxeval" = 1.0e+5)
+default_params = c(0.2, 0.6, 0, 0.1)
+lower_bounds = c(0.01, 0.1, 0, 0)
+upper_bounds = c(0.5, 1, 5, 0.3)
+time = 0:6
+```
+
+
+```{r, results="hold"}
+dt_VFL_long_fit = dt_VFL_long_mean_class %>%
+  # fit the truncated sine wave to probabilities of every decoding timecourse:
+  .[, by = .(participant, stim), {
+    res <- nloptr(
+      x0 = default_params, eval_f = sine_truncated_eval, time = time,
+      data = mean_probability, lb = lower_bounds, ub = upper_bounds, opts = opts)
+    list(
+      num_trs = .N,
+      frequency = res$solution[1],
+      wavelength = 1/res$solution[1],
+      amplitude = res$solution[2],
+      shift = res$solution[3],
+      baseline = res$solution[4],
+      params = list(res$solution)
+    )}] %>%
+  verify(all(num_trs == length(time)))
+# print the mean model parameters:
+summary(dt_VFL_long_fit[, c("frequency", "wavelength", "amplitude", "shift", "baseline")])
+# calculate the mean parameters across all participants to be used later:
+mean_parameters = dt_VFL_long_fit %>%
+  # average the fitted parameters across participants:
+  .[, .(
+    mean_freq = mean(frequency),
+    mean_wavelength = mean(wavelength),
+    mean_amplitude = mean(amplitude),
+    mean_shift = mean(shift),
+    mean_baseline = mean(baseline)
+  )]
+```
+
+We fit the sine response function for every participant using individual parameters:
+
+```{r}
+dt_VFL_long_fit_single = dt_VFL_long_fit %>%
+  # calculate a sine-wave response function timecourse for every participant:
+  .[, by = .(participant, stim), .(
+    csine = sine_truncated(params = unlist(params), seq(0, 6, 0.1))
+  )] %>%
+  # add a counter that is used for plotting below:
+  .[, by = .(participant, stim), ":=" (
+    t = seq(0, 6, 0.1))]
+```
+
+#### Figure S4a
+
+We plot the single sine wave fits for three example participants (supplement):
+
+```{r, echo=FALSE}
+# set seed to reproduce random id sampling:
+set.seed(18)
+num_sub_select = 3
+# select random example participants:
+select_id = sample(x = unique(dt_VFL_long_fit_single$participant), size = num_sub_select)
+fig_s1 = ggplot(data = subset(dt_VFL_long_fit_single, participant %in% select_id),
+                aes(x = t, y = csine * 100)) +
+  geom_point(aes(color = "Model"), alpha = 0.5) +
+  geom_line(data = subset(dt_VFL_long_mean_class, participant %in% select_id),
+            aes(x = (seq_tr - 1), y = mean_probability * 100, color = "Data")) +
+  geom_point(data = subset(dt_VFL_long_mean_class, participant %in% select_id),
+             aes(x = (seq_tr - 1), y = mean_probability * 100, color = "Data")) +
+  scale_colour_manual(name = "", values = c("gray", "black")) +
+  facet_grid(vars(as.factor(participant)), vars(as.factor(stim))) +
+  # coord_capped_cart(left = "both", bottom = "both") +
+  xlab("Time from stimulus onset (in TRs)") + ylab("Probability (%)") +
+  scale_x_continuous(labels = label_fill(seq(1, 7, 1), mod = 1), breaks = seq(0, 6, 1)) +
+  theme(legend.position = "top", legend.direction = "horizontal",
+        legend.justification = "center", legend.margin = margin(0, 0 ,0, 0),
+        legend.box.margin = margin(t = 0, r = 0, b = -10, l = 0)) +
+  theme(strip.text = element_text(margin = margin(b = 2, t = 2, r = 2, l = 2))) +
+  theme(axis.title.x = element_blank()) +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank())
+fig_s1
+```
+
+```{r, include=FALSE, eval=FALSE, echo=FALSE}
+ggsave(filename = "highsspeed_plot_decoding_oddball_single_sine_fits.pdf",
+       plot = last_plot(), path = path_figures, scale = 1,
+       dpi = "retina", width = 6, height = 4)
+```
+
+#### Source Data File Fig. S4a
+
+```{r, echo=TRUE}
+dt_VFL_long_mean_class %>%
+  write.csv(., file = file.path(path_sourcedata, "source_data_figure_s4a.csv"),
+            row.names = FALSE)
+```
+
+We calculate the mean shape of the sine wave response function across participants:
+
+```{r, echo=TRUE}
+dt_VFL_long_fit_mean = dt_VFL_long_fit %>%
+  # average the fitting parameters across participants:
+  .[, by = .(stim), .(
+    num_subs = .N,
+    mean_freq = mean(frequency),
+    mean_amplitude = mean(amplitude),
+    mean_shift = mean(shift),
+    mean_baseline = mean(baseline)
+  )] %>%# verify(all(num_subs == 36)) %>%
+  .[, by = .(stim), .(
+    csine = sine_truncated(params = c(mean_freq, mean_amplitude, mean_shift, mean_baseline),
+      seq(0, 6, 0.1)))] %>%
+  .[, by = .(stim), ":=" (
+    t = seq(0, 6, 0.1))]
+```
+
+#### Figure S4b
+
+```{r, echo=TRUE}
+fig_s2 = ggplot(data = dt_VFL_long_mean_class) +
+  geom_line(data = dt_VFL_long_mean_class,
+            aes(x = (seq_tr - 1), y = mean_probability * 100, group = as.factor(participant),
+                color = "Data"), alpha = 0.3) +
+  geom_line(data = dt_VFL_long_fit_mean, aes(x = t, y = csine * 100, color = "Model"),
+            size = 1) +
+  facet_wrap(~ as.factor(stim), nrow = 1) +
+  # coord_capped_cart(left = "both", bottom = "both", ylim = c(0,100)) +
+  xlab("Time from stimulus onset (in TRs)") + ylab("Probability (%)") +
+  scale_colour_manual(name = "", values = c("gray", "black"), guide = 'none') +
+  scale_x_continuous(labels = label_fill(seq(1, 7, 1), mod = 1), breaks = seq(0, 6, 1)) +
+  #theme(plot.margin = unit(c(t = 1, r = 1, b = 1, l = 1), "pt")) +
+  theme(legend.position = "bottom", legend.direction = "horizontal",
+        legend.justification = "center", legend.margin = margin(0, 0, 0, 0),
+        legend.box.margin = margin(t = -10, r = 0, b = 0, l = 0)) +
+  theme(strip.text = element_text(margin = margin(b = 2, t = 2, r = 2, l = 2))) +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank())
+fig_s2
+```
+
+```{r, include=FALSE, eval=FALSE, echo=FALSE}
+ggsave(filename = "fmrireplay_plot_decoding_VFL_mean_sine_fits.pdf",
+       plot = last_plot(), path = path_figures, scale = 1,
+       dpi = "retina", width = 5, height = 3)
+```
+
+#### Source Data File Fig. S4b
+
+```{r, echo=TRUE}
+dt_VFL_long_mean_class %>%
+  write.csv(., file = file.path(path_sourcedata, "source_data_figure_s4b.csv"),
+            row.names = FALSE)
+```
+
+#### Figure S4
+
+```{r}
+plot_grid(fig_s1, fig_s2, nrow = 2, ncol = 1, hjust = c(0, 0),
+          rel_heights = c(4, 2), labels = c("a", "b"), label_fontface = "bold")
+```
+
+```{r, include=FALSE, eval=FALSE, echo=FALSE}
+ggsave(filename = "fmrireplay_plot_decoding_VFL_supplement.pdf",
+       plot = last_plot(), path = path_figures, scale = 1,
+       dpi = "retina", width = 7, height = 7)
+
+```
+
+We evaluate the response function for two time-shifted events:
+
+```{r}
+# horizontal phase shift (in TRs) that will be added to the second sine wave:
+add_shift = 0.5 # the temporal difference between two sine functions
+time = seq(0, 10, 0.1)
+dt_VFL_long_fit_shift = dt_VFL_long_fit %>%
+  # average the fitted parameters across participants:
+  .[, .(
+    mean_freq = mean(frequency),
+    mean_amplitude = mean(amplitude),
+    mean_shift = mean(shift),
+    mean_baseline = mean(baseline)
+  )] %>%
+  # add variable that adds shift (in TRs) for the second sine wave:
+  mutate(mean_shift_shifted = mean_shift + add_shift) %>% 
+  mutate(amp = mean_amplitude * sin(add_shift * mean_freq * pi)) %>%
+  mutate(freq = mean_freq / (add_shift * mean_freq + 1)) %>% setDT(.) %>%
+  # calculate first and second response filter time-courses
+  .[, .(
+    first = sine_truncated(params = c(mean_freq, mean_amplitude, mean_shift, mean_baseline), time),
+    second = sine_truncated(params = c(mean_freq, mean_amplitude, mean_shift_shifted, mean_baseline), time),
+    cosine = amp * sin(2 * pi * time * freq - 2 * pi * freq * mean_shift),
+    t = time
+  )] %>%
+  # shift the cosine wave by 0.6 (only for illustrational purposes):
+  mutate(cosine = cosine - 0.5) %>%
+  setDT(.) %>%
+  # signify the tails of the sine wave (that will otherwise be flattened):
+  .[time < mean_parameters$mean_shift, ":=" (
+    cosine_tails = cosine,
+    cosine = NA)] %>%
+  .[time > (mean_parameters$mean_shift + add_shift + 1/mean_parameters$mean_freq), ":=" (
+    cosine_tails = cosine,
+    cosine = -NA)] %>%
+  # calculate the difference between the first and second wave
+  # adjust by 0.2 for illustrational purposes only:
+  mutate(difference = first - second -0.2) %>%
+  gather(key = "event", value = "probability", -t)
+```
+
+We calculate the mean probability timecourses for the true stimulus class across participants:
+
+```{r, ech0=TRUE}
+# calculate the mean decoding time course across all classes and participants:
+dt_VFL_long_mean = dt_prob %>%
+  # filter for oddball multivariate data and one-versus-rest classification only:
+  filter(test_set == "test-VFL_long" & class != "other" & mask == "mask_vis_mtl") %>%
+  # filter out excluded participants:
+  filter(!(participant %in% sub_exclude)) %>%
+  # filter for all trials where the predicted class matches the true stimulus:
+  filter(class == stim) %>% 
+  setDT(.) %>%
+  # calculate the mean decoding time courses for each participant:
+  .[, by = .(participant, stim, seq_tr), .(
+    mean_probability = mean(probability, na.rm = TRUE) * 100)] %>%
+  # average mean decoding time courses across participants:
+  .[, by = .(stim, seq_tr), .(
+    mean_probability = mean(mean_probability),
+    num_subs = .N,
+    sem_upper = mean(mean_probability) + (sd(mean_probability)/sqrt(.N)),
+    sem_lower = mean(mean_probability) - (sd(mean_probability)/sqrt(.N))
+  )]
+  # verify(all(num_subs == 36))
+```
+
+#### Figure 2c
+
+```{r, echo=FALSE}
+fig_a = ggplot(data = dt_VFL_long_mean, aes(x = (seq_tr - 1), y = mean_probability, group = stim)) + #probability for each stimuli
+  geom_ribbon(aes(ymin = sem_lower, ymax = sem_upper), alpha = 0.1, color = NA) + #shadow for SEM
+  geom_line(mapping = aes(color = "Data"), alpha = 1) +
+  geom_point(mapping = aes(color = "Data"), alpha = 1, pch = 16) +
+  geom_line(data = subset(dt_VFL_long_fit_shift, event == "first"),
+            aes(x = t, y = probability * 100, color = "Model"),
+            size = 2, inherit.aes = FALSE) +
+  coord_capped_cart(ylim = c(0, 100),
+                    xlim = c(0, 6), expand = TRUE) +
+  xlab("Time (TRs)") + ylab("Probability (%)") +
+  scale_colour_manual(name = "", values = c("gray", "black")) +
+  scale_fill_manual(name = "", values = c("gray", "black")) +
+  scale_x_continuous(labels = label_fill(seq(1,7,1), mod = 1), breaks = seq(0,6,1)) +
+  scale_y_continuous(labels = label_fill(seq(0, 80, 20), mod = 1), breaks = seq(0, 80, 20)) +
+  theme(legend.position = "top", legend.direction = "horizontal",
+        legend.justification = "center", legend.margin = margin(0, 0 ,0, 0),
+        legend.box.margin = margin(t = 0, r = 0, b = -60, l = 0)) +
+  guides(color = guide_legend(ncol = 2)) +
+  # add the shift parameter:
+  geom_segment(aes(x = 0, xend = mean_parameters$mean_shift, yend = 65, y = 65),
+               color = "darkgray", linetype = "dashed") +
+  annotate("text", x = mean_parameters$mean_shift/2, y = 70,
+           label = paste("italic(d)"), color = "darkgray", hjust = 0.5, parse = TRUE) +
+  # add the wavelength parameter:
+  geom_segment(aes(x = mean_parameters$mean_shift, xend = mean_parameters$mean_shift + 1/mean_parameters$mean_freq,
+                   yend = 70, y = 70), color = "darkgray", linetype = "dashed") +
+  annotate("text", x = mean_parameters$mean_shift + 1/(2 * mean_parameters$mean_freq), y = 75,
+           label = paste("italic(lambda)"), color = "darkgray", hjust = 0.5, parse = TRUE) +
+  # add the amplitude parameter:
+  geom_segment(aes(x = mean_parameters$mean_shift + 1/(2 * mean_parameters$mean_freq),
+                   xend = mean_parameters$mean_shift + 1/(2 * mean_parameters$mean_freq),
+                   y = mean_parameters$mean_baseline * 100,
+                   yend = (mean_parameters$mean_baseline + mean_parameters$mean_amplitude) * 100),
+               color = "darkgray", linetype = "dashed") +
+  annotate("text", x = mean_parameters$mean_shift + 1/(2 * mean_parameters$mean_freq) - 0.25,
+           y = (mean_parameters$mean_baseline + mean_parameters$mean_amplitude / 2) * 100,
+           label = paste("italic(A)"), color = "darkgray", parse = TRUE) + 
+  # add the baseline parameter:
+  geom_segment(aes(x = mean_parameters$mean_shift + 1/(2 * mean_parameters$mean_freq) - 0.2,
+                   xend = mean_parameters$mean_shift + 1/(2 * mean_parameters$mean_freq) - 0.2,
+                   y = 0, yend = mean_parameters$mean_baseline * 100),
+               color = "darkgray", linetype = "dashed") +
+  annotate("text", x = mean_parameters$mean_shift + 1/(2 * mean_parameters$mean_freq) - 0.25 - 0.2,
+           y = mean_parameters$mean_baseline / 2 * 100,
+           label = paste("italic(b)"), color = "darkgray", parse = TRUE) +
+  annotate("text", x = 6, y = 0, label = "1 TR = 1.3 s",
+             hjust = 1, size = rel(2)) +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank())
+fig_a
+```
+
+```{r, include=FALSE, eval=FALSE, echo=FALSE}
+ggsave(filename = "fmrireplay_plot_decoding_VFL_sine_illustration_fig1.pdf",
+       plot = last_plot(), path = path_figures, scale = 1,
+       dpi = "retina", width = 3, height = 3.1)
+```
+
+#### Source Data File Fig. 2c
+
+```{r, echo=TRUE}
+dt_VFL_long_mean %>%
+  write.csv(., file = file.path(path_sourcedata, "source_data_figure_2c.csv"),
+            row.names = FALSE)
+```
+
+### Response model and difference dynamics
+
+```{r, echo=TRUE}
+# get the average horizontal shift of the first sine wave:
+t_first = mean(dt_VFL_long_fit$shift)
+# calculate the shift of the second sine wave (shift + half a wavelength)
+t_second = mean(dt_VFL_long_fit$shift) + add_shift + 1/mean(dt_VFL_long_fit$freq)
+# calculate the time point of cross over between the two sine functions:
+t_crossover = 0.5/mean(dt_VFL_long_fit$freq) + mean(dt_VFL_long_fit$shift) + add_shift/2
+# create a vector of time steps:
+time = seq(0, 8, 0.1)
+
+max_prob = max(dt_VFL_long_fit_shift$probability[dt_VFL_long_fit_shift$event == "difference"], na.rm = TRUE)
+t_max_diff = dt_VFL_long_fit_shift$t[dt_VFL_long_fit_shift$probability == max_prob & !is.na(dt_VFL_long_fit_shift$probability)]
+a = dt_VFL_long_fit_shift$probability[dt_VFL_long_fit_shift$t == t_max_diff & dt_VFL_long_fit_shift$event == "first"]
+```
+
+#### Figure 2d
+
+```{r, echo=TRUE}
+# select colors used for plotting:
+colors = c("darkgray", "darkgray", "black", "dodgerblue", "red", "black")
+# plot sine wave difference illustration:
+fig_b = ggplot(data = dt_VFL_long_fit_shift, aes(
+  x = time, y = probability * 100, group = event, color = event)) +
+  # create rectangles to indicate the forward and backward phase:
+  annotate("rect", xmin = t_first, xmax = t_crossover, ymin = -80, ymax = 95,
+           alpha = 0.05, fill = "dodgerblue") +
+  annotate("rect", xmin = t_crossover, xmax = t_second, ymin = -80, ymax = 95,
+           alpha = 0.05, fill = "red") +
+  # plot the onset of the first event:
+  geom_vline(xintercept = t_first, color = "gray", linetype = "dashed") +
+  # plot the offset of the second event (d + lambda + s in manuscript text):
+  geom_vline(xintercept = t_second, color = "gray", linetype = "dashed") +
+  # plot the crossover (d + 0.5 * (lambda + s) in manuscript text)
+  geom_vline(xintercept = t_crossover, color = "gray", linetype = "dashed") +
+  # plot the horizontal line for the difference time course:
+  geom_hline(yintercept = -20, color = "gray") +
+  # plot the horizontal line for the cosine wave:
+  geom_hline(yintercept = -50, color = "gray") +
+  # plot the first and second event time courses:
+  geom_line(aes(x = t, linetype = fct_rev(event)), na.rm = TRUE) +
+  coord_capped_cart(ylim = c(-80, 85)) +
+  xlab("Time (in TRs)") + ylab("Probability (a.u.)") +
+  scale_colour_manual(name = "Serial event", values = colors) +
+  scale_linetype_manual(values = c(rep("solid", 3), "dashed", "solid")) +
+  scale_x_continuous(labels = c(label_fill(seq(1,7,1), mod = 1), rep("", 2)),
+                     breaks = seq(0,8,1)) +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_line(colour = "white"),
+        axis.line.y = element_line(colour = "white")) +
+  theme(legend.position = "none") +
+  annotate("label", x = 0.5, y = 45, label = "~1^'st'~event",
+           color = "dodgerblue", parse = TRUE, size = 3) +
+  annotate("label", x = 0.5, y = 30, label = "~2^'nd'~event",
+           color = "red", parse = TRUE, size = 3) +
+  annotate("label", x = 0.5, y = -7, label = "Difference",
+           color = "black", size = 3) +
+  annotate("label", x = 0.5, y = -35, label = "Difference\n(no flattening)",
+           color = "darkgray", size = 3) +
+  # add annotation for forward period:
+  geom_segment(aes(x = t_first, xend = t_crossover, yend = 85, y = 85,
+                   colour = "segment"), color = "dodgerblue") +
+  annotate("label", x = t_first + (t_crossover - t_first)/2, y = 85,
+           label = "Forward period",
+           color = "dodgerblue", fill = "white", hjust = 0.5) +
+  # add annotations for backward period:
+  geom_segment(aes(x = t_crossover, xend = t_second, y = 85, yend = 85, 
+                   colour = "segment"), color = "red") +
+  annotate("label", x = t_crossover + (t_second - t_crossover)/2, y = 85,
+           label = "Backward period",
+           color = "red", fill = "white", hjust = 0.5) +
+  # add annotation for early forward phase
+  geom_segment(aes(x = t_first, xend = t_first + (t_crossover - t_first)/2, yend = 70, y = 70,
+                   colour = "segment"), color = "gray") +
+  annotate("label", x = (t_first + (t_crossover - t_first)/4),
+           y = 70, label = "early",
+           color = "gray", fill = "white", hjust = 0.5) +
+  # add annotation for late forward phase
+  geom_segment(aes(x = t_first + (t_crossover - t_first)/2, xend = t_crossover,
+                   yend = 68, y = 68, colour = "segment"), color = "gray") +
+  annotate("label", x = (t_first + (t_crossover - t_first)/4 * 3),
+           y = 68, label = "late",
+           color = "gray", fill = "white", hjust = 0.5) +
+  # add annotation for early backward phase
+  geom_segment(aes(x = t_crossover, xend = t_crossover + (t_second - t_crossover)/2,
+                   yend = 70, y = 70, colour = "segment"), color = "gray") +
+  annotate("label", x = (t_crossover + (t_second - t_crossover)/4),
+           y = 70, label = "early", color = "gray", fill = "white", hjust = 0.5) +
+  # add annotation for late backward phase
+  geom_segment(aes(x = t_crossover + (t_second - t_crossover)/2, xend = t_second,
+                   yend = 68, y = 68, colour = "segment"), color = "gray") +
+  annotate("label", x = (t_crossover + (t_second - t_crossover)/4 * 3),
+           y = 68, label = "late", color = "gray", fill = "white", hjust = 0.5) +
+  # add annotation for delta:
+  geom_segment(aes(x = t_first + (t_crossover - t_first)/2,
+                   xend = t_first + (t_crossover - t_first)/2 + add_shift,
+                   y = 35 , yend = 35, colour = "segment"), color = "darkgray", linetype = "dotted") +
+  annotate("text", x = t_first + (t_crossover - t_first)/2 - 0.5 + add_shift / 2, y = 35,
+           label = "delta", color = "darkgray", hjust = 0.5, parse = TRUE) +
+  # add annotation for TRs:
+  annotate("text", x = 8, y = -80, label = "1 TR = 1.3 s",
+             hjust = 1, size = rel(2)) +
+  theme(axis.line.x = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank())
+fig_b
+```
+
+```{r, include=FALSE, eval=FALSE, echo=FALSE}
+ggsave(filename = "fmrireplay_plot_decoding_VFL_sine_illustration_figb.pdf",
+       plot = last_plot(), path = path_figures, scale = 1,
+       dpi = "retina", width = 5.5, height = 4.5)
+```
+
+#### Source Data File Fig. 2d
+
+```{r, echo=TRUE}
+# dt_odd_long_fit_shift %>%
+#   select(-classification) %>%
+#   write.csv(., file = file.path(path_sourcedata, "source_data_figure_2d.csv"),
+#             row.names = FALSE)
+```
+
+```{r, echo = TRUE}
+ampfun = function(s, A) {A*cos(s*mean(dt_VFL_long_fit$freq)*pi - 0.5*pi)}
+cs = seq(0, 0.5/mean(dt_VFL_long_fit$freq), 0.01)
+ba = data.table(cs = cs, diff = ampfun(cs, 1))
+fig_c = ggplot(data = ba, aes(x = cs, y = diff)) +
+  geom_line() +
+  xlab("Time-shift (in TRs)") + ylab("Max. diff. in amplitude") +
+  coord_capped_cart(xlim = c(0,3)) +
+  scale_x_continuous(labels = c("0", rep("", 2), "Resp. peak"), breaks = seq(0,3)) +
+  scale_y_continuous(labels = c("0", rep("", 3), "Max")) +
+  #theme(plot.margin = unit(c(t = 10, r = 30, b = 1, l = 1), "pt")) +
+  theme(axis.text.y = element_text(angle = 90, hjust = 0.5)) +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank())
+fig_c
+```
+
+```{r, include=FALSE, eval=FALSE, echo=FALSE}
+# ggsave(filename = "highspeed_plot_decoding_oddball_sine_illustration_fig3.pdf",
+#        plot = last_plot(), device = cairo_pdf, path = path_figures, scale = 1,
+#        dpi = "retina", width = 3, height = 2.5)
+```
+
+We plot a combination of the previous plots:
+
+```{r, echo=TRUE, fig.width = 7, fig.height = 3}
+# plot_grid(fig_a, fig_b, ncol = 2, hjust = c(0,0),
+#           labels = c("c", "d", "e"), rel_widths = c(2, 4),
+#           label_fontface = "bold", label_size = 14)
+```
+
+```{r, include=FALSE, eval=FALSE, echo=FALSE}
+# ggsave(filename = "highspeed_plot_decoding_oddball_sine_illustration.pdf",
+#        plot = last_plot(), device = cairo_pdf, path = path_figures, scale = 1,
+#        dpi = "retina", width = 7, height = 3)
+```
+
+
+### Forward and backward period for different speeds
+
+Here, we calculate the expected forward and backward periods for two events
+separated by different speed levels (different values for delta).
+
+```{r}
+calc_periods = function(speed, stim_dur = 0, num_stim = 4, tr = 1.3){
+  # mean wavelength based on fitted models, in TRs, round to two digits:
+  lambda = round(mean_parameters$mean_wavelength, 2)
+  # mean phase-shift based on fitted models, in TRs, round to two digits:
+  phase_shift = round(mean_parameters$mean_shift, 2)
+  # delta, in sec (time shift depending on speed) :(the first one and the last one)
+  delta_sec = stim_dur * (num_stim - 1) + (num_stim - 1) * speed
+  # delta, in trs:
+  delta_tr = delta_sec / tr
+  # end of forward period, in TRs:
+  fwd_end = 0.5 * (lambda + delta_tr) + phase_shift
+  # end of the backward period, in TRs:
+  bwd_end = lambda + phase_shift + delta_tr
+  # forward period, in TRs:
+  forward = list(seq(round(phase_shift) + 1, round(fwd_end - 0.5) + 1))
+  # backward period, in TRs:
+  backward = list(seq(round(fwd_end + 0.5) + 1, round(bwd_end) + 1))
+  # entire relevant trial period, in rounded TRs:
+  trial_period = list(seq(round(phase_shift) + 1, round(lambda + phase_shift + delta_tr) + 1))
+  # save results as a data table and return results:
+  dt = data.table(speed, lambda, delta_sec, delta_tr, fwd_end, bwd_end, forward, backward, trial_period)
+  return(dt)
+}
+# get the relevant timeperiods for each sequence speed condition:
+speeds = c(0.032, 0.064, 0.128, 0.512, 1.024, 2.048, 3.072, 4.096)
+dt_periods = do.call(rbind, lapply(speeds, calc_periods))
+# can't store dt_period in linux because of lists
+# rmarkdown::paged_table(dt_periods)
+```
+
+We save the periods of interest for different speeds which will be used for the analysis of sequence and repetition trials:
+
+```{r}
+save(dt_periods, file = file.path(path_root, 'derivatives', 'sinusoidal_response_model', 'data', "tmp", "dt_periods.Rdata"))
+```
+
+### Probability differences at different speeds
+
+We plot the probability differences at different speeds:
+
+```{r}
+time = seq(0, 9, 0.1)
+stim_dur = 0
+
+dt_VFL_seq_sim = dt_VFL_long_fit %>% setDT(.) %>%
+  # average the fitted parameters across stimuli for each participant:
+  .[, by = .(participant), .(
+    mean_freq = mean(frequency),
+    mean_amplitude = mean(amplitude),
+    mean_shift = mean(shift),
+    mean_baseline = mean(baseline)
+  )] %>%
+  # repeat rows once for each speed condition (8 repetitions in total):
+  .[rep(seq(1, nrow(.)), length(speeds))] %>%
+  # add the different speed conditions for every participant:
+  .[, by = .(participant), ":=" (speed = speeds, num_events = 1)] %>%
+  # repeat rows once for each hypothetical event (here, 2 events):
+  .[rep(seq(1, nrow(.)), num_events)] %>%
+  # add a counter for the number of events:
+  .[, by = .(participant, speed), ":=" (event = 4)] %>%
+  # calculate a speed-specific shift for each event:
+  .[, by = .(participant, speed, event), {
+    shift = (speed * (event - 1) + (event - 1) * stim_dur)/1.3
+    amp = mean_amplitude * sin(shift * 0.5 * mean_freq * pi)
+    freq = (1/(1/mean_freq + shift))
+    c_d = amp * sin(2 * pi * time * freq - 2 * pi * freq * mean_shift)
+    # flatten the tails of the response function
+    cidx = time < mean_shift | time > (mean_shift + (1 / freq))
+    c_d[cidx] = 0
+    # save the response function:
+    list(time = time, probability = c_d,shift=shift,freq=freq,amp=amp)
+  }] %>%
+  setDT(.)
+
+dt_VFL_seq_sim_diff = dt_VFL_seq_sim %>% 
+  .[, by = .(speed, time), .(
+    num_subs = .N,
+    mean_difference = mean(probability),
+    sem_upper = mean(probability) + (sd(probability)/sqrt(.N)),
+    sem_lower = mean(probability) - (sd(probability)/sqrt(.N))
+  )] 
+# %>% verify(all(num_subs == 36))
+```
+
+```{r}
+# save(dt_odd_seq_sim_diff, file = file.path(
+#   path_root, "data", "tmp", "dt_odd_seq_sim_diff.Rdata"))
+# save(dt_odd_seq_sim, file = file.path(
+#   path_root, "data", "tmp", "dt_odd_seq_sim.Rdata"))
+```
+
+#### Figure 2e
+
+```{r}
+set.seed(42)
+num_speed_select = 7
+# select random example participants:
+select_speed = unique(dt_VFL_seq_sim_diff$speed)
+
+fig_replay_sim_diff = ggplot(data = subset(dt_VFL_seq_sim_diff, speed %in% select_speed), 
+                             mapping = aes(x = time, y = as.numeric(mean_difference), 
+                                           color = as.factor(speed * 1000),
+  fill = as.factor(speed * 1000))) +
+  geom_hline(aes(yintercept = 0), linetype = "solid", color = "gray") +
+  geom_ribbon(aes(ymin = sem_lower, ymax = sem_upper), alpha = 0.5, color = NA) +
+  geom_line() +
+  theme(legend.position = "top", legend.direction = "horizontal",
+        legend.justification = "center", legend.margin = margin(0, 0, 0, 0),
+        legend.box.margin = margin(t = 0, r = 0, b = -5, l = 0)) +
+  xlab("Time from sequence onset (TRs)") + ylab("Probability difference") +
+  scale_colour_viridis(name = "Speed (ms)", discrete = TRUE, option = "cividis") +
+  scale_fill_viridis(name = "Speed (ms)", discrete = TRUE, option = "cividis") +
+  coord_capped_cart(expand = TRUE,
+                    ylim = c(-0.6, 0.6), xlim = c(0, 8)) +
+  scale_x_continuous(labels = label_fill(seq(1, 9, 1), mod = 4), breaks = seq(0, 8, 1)) +
+  guides(color = guide_legend(nrow = 1)) +
+  geom_segment(aes(x = 0, xend = 0, y = 0.01, yend = 0.4),
+               arrow = arrow(length = unit(5, "pt")), color = "darkgray") +
+  geom_segment(aes(x = 0, xend = 0, y = -0.01, yend = -0.4),
+               arrow = arrow(length = unit(5, "pt")), color = "darkgray") +
+  annotate(geom = "text", x = 0.4, y = 0.2, label = "Forward order",
+           color = "darkgray", angle = 90, size = 3) +
+  annotate(geom = "text", x = 0.4, y = -0.2, label = "Backward order",
+           color = "darkgray", angle = 90, size = 3) +
+  annotate("text", x = 12, y = -0.6, label = "1 TR = 1.3 s",
+             hjust = 1, size = rel(2)) +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank())
+fig_replay_sim_diff
+```
+
+```{r, include=FALSE, eval=FALSE, echo=FALSE}
+ggsave(filename = "fmrireplay_plot_decoding_VFL_sequence_predictions.pdf",
+       plot = last_plot(), path = path_figures, scale = 1,
+       dpi = "retina", width = 5.5, height = 3)
+```
+
+#### Source Data File Fig. 2e
+
+```{r, echo=TRUE}
+dt_VFL_seq_sim_diff %>%
+  write.csv(., file = file.path(path_sourcedata, "source_data_figure_2e.csv"),
+            row.names = FALSE)
+```
+
+### Figure 2
+
+```{r, echo=TRUE, fig.width=8, fig.height=3}
+# upper = plot_grid(fig_VFL_peak, plot.VFL.long, fig_a, labels = c("a", "b", "c"), ncol = 3,
+#                   rel_widths = c(0.8, 3.5, 2), label_fontface = "bold", hjust = c(0, 0))
+# lower = plot_grid(fig_b, fig_replay_sim_diff, labels = c("d", "e"), nrow = 1,
+#                   label_fontface = "bold", hjust = c(0, 0), rel_widths = c(0.45, 0.53))
+# plot_grid(upper, lower, nrow = 2, ncol = 1, rel_heights = c(2.5, 3))
+```
+
+```{r}
+# ggsave(filename = "highspeed_plot_decoding_oddball_data.pdf",
+#        plot = last_plot(), device = cairo_pdf, path = path_figures, scale = 1,
+#        dpi = "retina", width = 10, height = 6.5)
+# ggsave(filename = "wittkuhn_schuck_figure_2.pdf",
+#        plot = last_plot(), device = cairo_pdf, path = path_figures, scale = 1,
+#        dpi = "retina", width = 10, height = 6.5)
+```
+
+## Decoding: Sequence trials
+
+#### Data preparation
+
+We create a function to determine early and late zones of forward and backward periods:
+
+```{r}
+get_zones = function(trs_in){
+  if (length(trs_in) == 4) {
+    early = trs_in[c(2)]
+    late = trs_in[c(4)]
+  } else if (length(trs_in) == 5) {
+    early = trs_in[c(2)]
+    late = trs_in[c(4)]
+  } else if (length(trs_in) == 6) {
+    early = trs_in[c(2, 3)]
+    late = trs_in[c(5, 6)]}
+  # } else if (length(trs_in) == 6) {
+  #   early = trs_in[c(2, 3)]
+  #   late = trs_in[c(5, 6)]
+  # } else if (length(trs_in) == 7) {
+  #   early = trs_in[c(2, 3)]
+  #   late = trs_in[c(5, 6)]
+  # }
+  return(list(early = early, late = late))
+}
+```
+
+We prepare event and decoding data of sequence trials:
+
+```{r}
+# create a subset of the events data table only including sequence task events:
+dt_replay_event = dt_prob %>%
+  filter(test_set == "test-rep_long")
+# create a subset of the decoding data only including the sequence task data:
+dt_replay_seq = dt_prob %>%
+  filter(test_set == "test-rep_long" & class != "other" & mask == "union" & stim != "cue") %>%
+  setDT(.) 
+# %>%
+#   # add serial position, change trial and target cue to the sequence data table:
+#   .[, c("position", "change", "trial_cue", "accuracy") := get_pos(
+#     .SD, dt_replay_event), by = .(participant, trials, class), .SDcols = c("participant", "trials", "class")] %>%
+#   # add variable to later pool trial_cue_position 1 to 3:
+#   mutate(cue_pos_label = ifelse(trial_cue_position <= 3, "1-3", trial_cue_position)) %>%
+#   setDT(.)
+```
+
+We define the forward and backward periods depending on the response functions:
+
+```{r}
+# define forward and backward period depending on response functions:
+for (cspeed in speeds) {
+  for (period in c("forward", "backward")) {
+    # get trs in the relevant forward or backward period based on response functions:
+    if (period == 'forward') {
+      trs_period = dt_periods[dt_periods$speed == cspeed]$forward[[1]]
+      } else if (period == 'backward') {
+      trs_period = dt_periods[dt_periods$speed == cspeed]$backward[[1]]}
+    # set the period variable in the sequence data table accordingly:
+    dt_replay_seq$period[
+        dt_replay_seq$seq_tr %in% trs_period] = period
+    for (zone in c("early", "late")) {
+      trs_zone = get_zones(trs_period)[[zone]]
+      dt_replay_seq$zone[
+          dt_replay_seq$seq_tr %in% trs_zone] = zone
+    }
+  }
+}
+# assign the excluded label to all trs that are not in the forward or backward period:
+dt_replay_seq$period[is.na(dt_replay_seq$period)] = "excluded"
+```
+
+We exclude all participants with below-chance performance from the analyses:
+
+```{r}
+# exclude participants with below-chance performance:
+dt_replay_seq = dt_replay_seq %>%
+  filter(!(participant %in% sub_exclude)) %>%
+  verify(length(unique(participant)) == 34) %>%
+  setDT(.)
+```
+
+### Probability time courses
+
+We calculate the decoding probability time-courses:
+
+```{r}
+
+library(data.table)
+dt_replay_seq <- setDT(dt_replay_seq)
+# probabilities are normalized for each class within a trial to sum up to 1
+# normalized within trial and between several seq_tr ###
+dt_replay_seq = dt_replay_seq %>%
+        filter(test_set == 'test-rep_long') %>%
+        setDT(.) %>%
+        .[, by = .(mask, participant, test_set, classifier, run, trials, class), ":=" (
+  probability_norm = probability / sum(probability),
+  probability_zscore = (probability - mean(probability))/sd(probability),
+  probability_cum = cumsum(probability) / max(cumsum(probability)))]
+
+# order sequence trial data by participant, classifier, trial and serial TR:
+dt_replay_seq = setorder(dt_replay_seq,mask, participant, test_set, classifier, run, trials, class) %>%
+        setDT(.)
+
+
+# select the variable of interest:
+variable = "probability_norm"
+dt_replay_seq$class_label = 0
+dt_replay_seq[dt_replay_seq$class=='girl']$class_label = 1
+dt_replay_seq[dt_replay_seq$class=='scissors']$class_label = 2
+dt_replay_seq[dt_replay_seq$class=='zebra']$class_label = 3
+dt_replay_seq[dt_replay_seq$class=='banana']$class_label = 4
+
+dt_replay_seq %>%
+        verify(class_label != 0)
+
+# filter excluded subjects
+replay_sequences = replay_sequences %>%
+         filter(!subject %in% sub_excludes) %>%
+        verify(length(unique(subject)) == 34) %>%
+        setDT(.)
+
+# set the sequence position for each subject and each mental simulation condition
+dt_replay_seq$position = 0
+for (participants in unique(dt_replay_seq$participant)) {
+  dt_replay_seq[dt_replay_seq$participant==participants & dt_replay_seq$marker ==51]$position = 
+    match(dt_replay_seq[dt_replay_seq$participant==participants & dt_replay_seq$marker ==51]$class_label,
+          replay_sequences[subject==paste('sub-',str_pad(participants, 2, side = "left", pad = "0"),sep=''),2:5])
+  dt_replay_seq[dt_replay_seq$participant==participants & dt_replay_seq$marker ==52]$position = (5-
+    match(dt_replay_seq[dt_replay_seq$participant==participants & dt_replay_seq$marker ==52]$class_label,
+          replay_sequences[subject==paste('sub-',str_pad(participants, 2, side = "left", pad = "0"),sep=''),2:5]))
+}
+
+dt_replay_seq_prob =  dt_replay_seq %>%
+        # filter(marker == 52) %>%
+  # average across trials separately each position, TR, and participant
+  .[, by = .(participant, seq_tr, position), .(
+    num_trials = .N,
+    mean_prob = mean(get('probability')) * 100
+  )] %>%
+  # check if the averaged data consists of 15 sequence trial per participant:
+  # verify(all(num_trials == 15)) %>%
+  # average across participants and calculate standard error of the mean:
+  .[, by = .(seq_tr, position), .(
+    num_subs = .N,
+    mean_prob = mean(mean_prob),
+    sem_upper = mean(mean_prob) + (sd(mean_prob)/sqrt(.N)),
+    sem_lower = mean(mean_prob) - (sd(mean_prob)/sqrt(.N))
+  )] %>%
+  # check if averaged data is consistent with expected number of participants:
+  verify(all(num_subs == 34)) %>%
+  # create a new variable that expresses TRs as time from stimulus onset:
+  mutate(time = (seq_tr - 1) * 1.3) %>%
+  setDT(.)
+```
+
+#### Figure 3a
+
+We plot the decoding probability time-courses:
+This is very important sanity check for replay decoding!
+
+```{r}
+plot = dt_replay_seq_prob %>%
+  ggplot(., mapping = aes(
+  x = as.factor(seq_tr), y = as.numeric(mean_prob),
+  group = as.factor(position)), environment = environment()) +
+  geom_rect(data = dt_reduced, aes(
+    xmin = xmin, xmax = xmax, ymin = 0, ymax = 40),
+    alpha = 0.05, inherit.aes = FALSE, show.legend = FALSE, fill = dt_reduced$fill) +
+  geom_ribbon(aes(ymin = sem_lower, ymax = sem_upper,
+                  fill = as.factor(position)), alpha = 0.3) +
+  geom_line(mapping = aes(color = as.factor(position))) +
+  theme(legend.position = "top", legend.direction = "horizontal",
+        legend.justification = "center", legend.margin = margin(0, 0, 0, 0),
+        legend.box.margin = margin(t = 0, r = 0, b = -5, l = 0)) +
+  xlab("Time from sequence onset (TRs; 1 TR = 1.3 s)") +
+  ylab("Probability (%)") +
+  scale_color_manual(values = color_events, name = "Serial event") +
+  scale_fill_manual(values = color_events, name = "Serial event") +
+  scale_x_discrete(labels = label_fill(seq(1, 10, 1), mod = 4), breaks = seq(1, 10, 1)) +
+  coord_capped_cart(expand = TRUE, ylim = c(5, 30)) +
+  theme(panel.border = element_blank(), axis.line = element_line()) +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) +
+  theme(strip.text.x = element_text(margin = margin(b = 2, t = 2))) +
+  guides(color = guide_legend(nrow = 1))
+
+plot
+
+
+```
+
+#### Source Data File Fig. 3a
+
+```{r, echo=TRUE}
+dt_pred_seq_prob %>%
+  write.csv(., file = file.path(path_sourcedata, "source_data_figure_3a.csv"),
+            row.names = FALSE)
+```
+
+We plot the decoding probabilities as a heat-map:
+
+```{r, echo=FALSE}
+  plot_data = subset(dt_replay_seq_prob)
+  ggplot(plot_data, aes(x = as.factor(position), y = as.factor(seq_tr), fill = as.numeric(mean_prob))) +
+    geom_tile() +
+    xlab("Serial event position") + ylab("Time from sequence onset (TRs)") +
+    scale_fill_viridis(option = "inferno", name = "Probability (%)") +
+    scale_y_discrete(labels = label_fill(seq(1, 10, 1), mod = 4), breaks = seq(1, 10, 1)) +
+    lemon::coord_capped_cart(expand = TRUE) +
+    theme(panel.border = element_blank(), axis.line = element_line()) +
+    theme(strip.text.x = element_text(margin = margin(b = 2, t = 2))) +
+    theme(legend.position = "top", legend.direction = "horizontal",
+            legend.justification = "center", legend.margin = margin(0, 0, 0, 0),
+            legend.box.margin = margin(t = 0, r = 0, b = -5, l = 0)) +
+    guides(color = guide_legend(nrow = 1)) +
+    theme(panel.border = element_blank(), axis.line = element_line())
+```
+
+### Regression slope timecourses
+
+```{r, echo=FALSE, eval=FALSE}
+# select positions within every TR that should be selected:
+pos_sel = seq(1, 4)
+set.seed(4)
+probability = runif(4)
+# earlier events have higher probability:
+probability = c(0.6, 0.9, 0.1, 0.5)
+position = seq(1, 4, 1)
+position = c(1, 3, 4, 2)
+ordered_positions = probability[order(probability, decreasing = TRUE)]
+diff(ordered_positions)
+# order the probabilities in decreasing order (first = highest):
+prob_order_idx = order(probability, decreasing = TRUE)
+# order the positions by probability:
+pos_order = position[prob_order_idx]
+# order the probabilities:
+prob_order = probability[prob_order_idx]
+# select positions
+pos_order_sel = pos_order[pos_sel]
+prob_order_sel = prob_order[pos_sel]
+```
+
+We compare the mean indices of association (regression slope, correlation, mean serial position) for every TR:
+
+```{r}
+# select positions within every TR that should be selected:
+pos_sel = seq(1, 4)
+# define relevant variables:
+variable = "probability_norm"
+cor_method = "kendall"
+# calculate indices of association at every TR:
+# options(warn=-1) 
+dt_replay_seq_cor = dt_replay_seq %>%
+  # here, we can filter for specific sequence events:
+  filter(position %in% seq(1, 4, by = 1)) %>%
+  setDT(.) %>%
+  # order positions by decreasing probability and calculate step size
+  # calculate correlation and slope between position and probability
+  # verify that there are five probabilities (one for each class) per volume
+  # verify that all correlations range between -1 and 1
+  .[, by = .(participant, trials, run, period, seq_tr), {
+    #trial_tITI is trial for each subject, tITI is the real tITI, seq_tr is TR for each trial, period=forward, backward or excluded(the first TR))
+    # order the probabilities in decreasing order (first = highest):
+    prob_order_idx = order(get(variable), decreasing = TRUE)
+    # order the positions by probability:
+    pos_order = position[prob_order_idx]
+    # order the probabilities:
+    prob_order = get(variable)[prob_order_idx]
+    # select positions
+    pos_order_sel = pos_order[pos_sel]
+    prob_order_sel = prob_order[pos_sel]
+    list(
+      # calculate the number of events:
+      num_events = length(pos_order_sel[!is.na(pos_order_sel)]),
+      # calculate the mean step size between probability-ordered events:
+      mean_step = mean(diff(pos_order_sel)),
+      # calculate the mean correlation between positions and their probabilities:
+      cor = cor.test(pos_order_sel, prob_order_sel, method = cor_method)$estimate,
+      # calculate the slope of a linear regression between position and probabilities:
+      slope = coef(lm(prob_order_sel ~ pos_order_sel))[2]
+      # verify that the number of events matches selection and correlations -1 < r < 1
+    )}] %>% verify(all(num_events == length(pos_sel))) %>% #verify(between(cor, -1, 1)) %>%
+  # average across trials for each participant (flip values by multiplying with -1):
+  # verify that the number of trials per participant is correct:
+  .[, by = .(participant, period, seq_tr), .(
+    num_trials = .N,
+    mean_cor = mean(cor) * (-1),
+    mean_step = mean(mean_step),
+    mean_slope = mean(slope) * (-1)
+  )] %>% 
+  # verify(all(num_trials == 15)) %>%
+  # shorten the period name:
+  mutate(period_short = ifelse(period == "forward", "fwd", period)) %>%
+  transform(period_short = ifelse(period == "backward", "bwd", period_short))  %>%
+  mutate(color = ifelse(period_short == "fwd", "dodgerblue", "red")) %>% setDT(.)
+```
+
+```{r, echo=FALSE, eval=FALSE, include=FALSE}
+# don't know what is the cluster_permutation.
+# cfg = list(variable = "mean_cor", threshold = 2.021, baseline = 0, n_perms = 10000, n_trs = 10)
+# dt_pred_seq_cor_cluster = cluster_permutation(dt_pred_seq_cor, cfg)
+```
+
+We compare the mean indices of association (regression slope, correlation,
+mean serial position) against zero (the expectation of no association)
+for every TR:
+
+```{r}
+seq_test_time <- function(data, variable){
+ # data = dt_replay_seq_cor
+ # variable= 'mean_cor'
+  data_out = data %>%
+    # average across participants for every speed at every TR:
+    # check if the number of participants matches:
+    .[, by = .(period, seq_tr), {
+      # perform a two-sided one-sample t-test against zero (baseline):
+      ttest_results = t.test(get(variable), alternative = "two.sided", mu = 0);
+      list(
+        num_subs = .N,
+        mean_variable = mean(get(variable)),
+        pvalue = ttest_results$p.value,
+        tvalue = ttest_results$statistic,
+        df = ttest_results$parameter,
+        cohens_d = round(abs(mean(mean(get(variable)) - 0)/sd(get(variable))), 2),
+        sem_upper = mean(get(variable)) + (sd(get(variable))/sqrt(.N)),
+        sem_lower = mean(get(variable)) - (sd(get(variable))/sqrt(.N))
+      )}]  %>% 
+    verify(all(num_subs == 34)) %>%
+    verify(all((num_subs - df) == 1)) %>%
+    # adjust p-values for multiple comparisons (filter for forward and backward period):
+    # check if the number of comparisons matches expectations:
+    .[period %in% c("forward", "backward"), ":=" (
+      num_comp = .N,
+      pvalue_adjust = p.adjust(pvalue, method = "fdr", n = .N)
+    )] %>% 
+    # verify(all(num_comp == 39, na.rm = TRUE)) %>%
+    # round the original p-values according to the apa standard:
+    mutate(pvalue_round = round_pvalues(pvalue)) %>%
+    # round the adjusted p-value:
+    mutate(pvalue_adjust_round = round_pvalues(pvalue_adjust)) %>%
+    # sort data table:
+    setorder(., period, seq_tr) %>%
+    # create new variable indicating significance below 0.05
+    mutate(significance = ifelse(pvalue_adjust < 0.05, "*", ""))
+  return(data_out)
+}
+```
+
+```{r}
+# filter for significant p-values to make reporting easier:
+replay_mean_cor=seq_test_time(data = dt_replay_seq_cor, variable = "mean_cor")
+replay_mean_step=seq_test_time(data = dt_replay_seq_cor, variable = "mean_step")
+replay_mean_slope=seq_test_time(data = dt_replay_seq_cor, variable = "mean_slope")
+
+rmarkdown::paged_table(seq_test_time(data = dt_replay_seq_cor, variable = "mean_cor"))
+rmarkdown::paged_table(seq_test_time(data = dt_replay_seq_cor, variable = "mean_step"))
+rmarkdown::paged_table(seq_test_time(data = dt_replay_seq_cor, variable = "mean_slope"))
+```
+
+
+```{r}
+plot_seq_cor_time = function(dt, variable){
+  # select the variable of interest, determine y-axis label and adjust axis:
+  if (variable == "mean_slope") {
+    ylabel = "Regression slope"
+    adjust_axis = 0.1
+  } else if (variable == "mean_cor") {
+    ylabel = expression("Correlation ("*tau*")")
+    adjust_axis = 1
+  } else if (variable == "mean_step") {
+    ylabel = "Mean step size"
+    adjust_axis = 1
+  }
+
+  plot = ggplot(data = dt, mapping = aes(
+    x = seq_tr, y = mean_variable))+
+    # group = as.factor(as.numeric(tITI) * 1000),
+    # fill = as.factor(as.numeric(tITI) * 1000))) +
+    geom_hline(aes(yintercept = 0), linetype = "solid", color = "gray") +
+    geom_ribbon(aes(ymin = sem_lower, ymax = sem_upper), alpha = 0.5, color = NA) +
+    geom_line() +
+    xlab("Time from sequence onset (TRs)") + ylab(ylabel) +
+    scale_colour_viridis(name = "Speed (ms)", discrete = TRUE, option = "cividis") +
+    scale_fill_viridis(name = "Speed (ms)", discrete = TRUE, option = "cividis") +
+    scale_x_continuous(labels = label_fill(seq(1, 10, 1), mod = 4), breaks = seq(1, 10, 1)) +
+    guides(color = guide_legend(nrow = 1)) +
+    annotate("text", x = 1, y = -0.4 * adjust_axis, label = "1 TR = 1.3 s",
+             hjust = 0, size = rel(2)) +
+    coord_capped_cart(expand = TRUE, ylim = c(-0.4 * adjust_axis, 0.4 * adjust_axis)) +
+    theme(panel.border = element_blank(), axis.line = element_line()) +
+    theme(axis.line = element_line(colour = "black"),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_blank(),
+          panel.background = element_blank()) +
+    theme(legend.position = "top", legend.direction = "horizontal",
+        legend.justification = "center", legend.margin = margin(t = 0, r = 0, b = 0, l = 0),
+        legend.box.margin = margin(t = 0, r = 0, b = 0, l = 0)) +
+    geom_segment(aes(x = 0.05, xend = 0.05, y = 0.01 * adjust_axis, yend = 0.4 * adjust_axis),
+                 arrow = arrow(length = unit(5, "pt")), color = "darkgray") +
+    geom_segment(aes(x = 0.05, xend = 0.05, y = -0.01 * adjust_axis, yend = -0.4 * adjust_axis),
+                 arrow = arrow(length = unit(5, "pt")), color = "darkgray") +
+    annotate(geom = "text", x = 0.4, y = 0.2 * adjust_axis, label = "Forward order",
+             color = "darkgray", angle = 90, size = 3) +
+    annotate(geom = "text", x = 0.4, y = -0.2 * adjust_axis, label = "Backward order",
+             color = "darkgray", angle = 90, size = 3)
+  return(plot)
+}
+```
+
+#### Figure 3b
+
+```{r}
+fig_seq_cor_time = plot_seq_cor_time(dt = subset(
+  seq_test_time(data = dt_replay_seq_cor, variable = "mean_cor")), variable = "mean_cor")
+
+fig_seq_slope_time = plot_seq_cor_time(dt = subset(
+  seq_test_time(data = dt_replay_seq_cor, variable = "mean_slope")), variable = "mean_slope")
+
+fig_seq_step_time = plot_seq_cor_time(dt = subset(
+  seq_test_time(data = dt_replay_seq_cor, variable = "mean_step")), variable = "mean_step")
+
+fig_seq_cor_time; fig_seq_slope_time; fig_seq_step_time
+```
+
+```{r, eval=FALSE, echo=FALSE, include=FALSE}
+# ggsave(filename = "highsspeed_plot_decoding_sequence_timecourses_slopes.pdf",
+#        plot = fig_seq_slope_time, device = cairo_pdf, path = path_figures, scale = 1,
+#        dpi = "retina", width = 5.5, height = 3)
+```
+
+#### Source Data File Fig. 3b
+
+```{r, echo=TRUE}
+# subset(
+#   seq_test_time(data = dt_pred_seq_cor, variable = "mean_slope"),
+#   classification == "ovr") %>%
+#   select(-classification, -num_subs, -num_comp, -pvalue_adjust,
+#          -pvalue_round, -pvalue_adjust_round, -pvalue, -df, -cohens_d,
+#          -tvalue, -significance) %>%
+#   write.csv(., file = file.path(path_sourcedata, "source_data_figure_3b.csv"),
+#             row.names = FALSE)
+```
+
+#### Source Data File Fig. S5a
+
+```{r, echo=TRUE}
+# subset(
+#   seq_test_time(data = dt_pred_seq_cor, variable = "mean_cor"),
+#   classification == "ovr") %>%
+#   select(-classification, -num_subs, -num_comp, -pvalue_adjust,
+#          -pvalue_round, -pvalue_adjust_round, -pvalue, -df, -cohens_d,
+#          -tvalue, -significance) %>%
+#   write.csv(., file = file.path(path_sourcedata, "source_data_figure_s5a.csv"),
+#             row.names = FALSE)
+```
+
+#### Source Data File Fig. S5c
+
+```{r, echo=TRUE}
+# subset(
+#   seq_test_time(data = dt_pred_seq_cor, variable = "mean_step"),
+#   classification == "ovr") %>%
+#   select(-classification, -num_subs, -num_comp, -pvalue_adjust,
+#          -pvalue_round, -pvalue_adjust_round, -pvalue, -df, -cohens_d,
+#          -tvalue, -significance) %>%
+#   write.csv(., file = file.path(path_sourcedata, "source_data_figure_s5c.csv"),
+#             row.names = FALSE)
+```
+
+We test depending on the target cue position:
+
+```{r}
+# select positions within every TR that should be selected:
+pos_sel = seq(1, 5)
+# define relevant variables:
+variable = "probability_norm"
+cor_method = "kendall"
+# calculate indices of association at every TR:
+dt_pred_seq_cor_cue = dt_pred_seq %>%
+  # here, we can filter for specific sequence events:
+  filter(position %in% seq(1, 5, by = 1)) %>% setDT(.) %>%
+  # order positions by decreasing probability and calculate step size
+  # calculate correlation and slope between position and probability
+  # verify that there are five probabilities (one for each class) per volume
+  # verify that all correlations range between -1 and 1
+  .[, by = .(id, classification, tITI, period, trial_tITI, seq_tr, cue_pos_label), {
+    # order the probabilities in decreasing order (first = highest):
+    prob_order_idx = order(get(variable), decreasing = TRUE)
+    # order the positions by probability:
+    pos_order = position[prob_order_idx]
+    # order the probabilities:
+    prob_order = get(variable)[prob_order_idx]
+    # select positions
+    pos_order_sel = pos_order[pos_sel]
+    prob_order_sel = prob_order[pos_sel]
+    list(
+      # calculate the number of events:
+      num_events = length(pos_order_sel[!is.na(pos_order_sel)]),
+      # calculate the mean step size between probability-ordered events:
+      mean_step = mean(diff(pos_order_sel)),
+      # calculate the mean correlation between positions and their probabilities:
+      cor = cor.test(pos_order_sel, prob_order_sel, method = cor_method)$estimate,
+      # calculate the slope of a linear regression between position and probabilities:
+      slope = coef(lm(prob_order_sel ~ pos_order_sel))[2]
+      # verify that the number of events matches selection and correlations -1 < r < 1
+    )}] %>% verify(all(num_events == length(pos_sel))) %>% #verify(between(cor, -1, 1)) %>%
+  # average across trials for each participant (flip values by multiplying with -1):
+  # verify that the number of trials per participant is correct:
+  .[, by = .(id, classification, tITI, period, seq_tr, cue_pos_label), .(
+    num_trials = .N,
+    mean_cor = mean(cor) * (-1),
+    mean_step = mean(mean_step),
+    mean_slope = mean(slope) * (-1)
+  )] %>%
+  verify(all(num_trials == 5)) %>%
+  # shorten the period name:
+  mutate(period_short = ifelse(period == "forward", "fwd", period)) %>%
+  transform(period_short = ifelse(period == "backward", "bwd", period_short))  %>%
+  mutate(color = ifelse(period_short == "fwd", "dodgerblue", "red")) %>% setDT(.)
+```
+
+```{r}
+seq_test_time_cue <- function(data, variable){
+  data_out = data %>%
+    # average across participants for every speed at every TR:
+    # check if the number of participants matches:
+    .[, by = .(classification, tITI, period, seq_tr, cue_pos_label), {
+      # perform a two-sided one-sample t-test against zero (baseline):
+      ttest_results = t.test(get(variable), alternative = "two.sided", mu = 0);
+      list(
+        num_subs = .N,
+        mean_variable = mean(get(variable)),
+        pvalue = ttest_results$p.value,
+        tvalue = ttest_results$statistic,
+        df = ttest_results$parameter,
+        cohens_d = round(abs(mean(mean(get(variable)) - 0)/sd(get(variable))), 2),
+        sem_upper = mean(get(variable)) + (sd(get(variable))/sqrt(.N)),
+        sem_lower = mean(get(variable)) - (sd(get(variable))/sqrt(.N))
+      )}] %>% verify(all(num_subs == 36)) %>% verify(all((num_subs - df) == 1)) %>%
+    # adjust p-values for multiple comparisons (filter for forward and backward period):
+    # check if the number of comparisons matches expectations:
+    .[period %in% c("forward", "backward"), by = .(classification), ":=" (
+      num_comp = .N,
+      pvalue_adjust = p.adjust(pvalue, method = "fdr", n = .N)
+    )] %>% #verify(all(num_comp == 39, na.rm = TRUE)) %>%
+    # round the original p-values according to the apa standard:
+    mutate(pvalue_round = round_pvalues(pvalue)) %>%
+    # round the adjusted p-value:
+    mutate(pvalue_adjust_round = round_pvalues(pvalue_adjust)) %>%
+    # sort data table:
+    setorder(., classification, period, tITI, seq_tr) %>%
+    # create new variable indicating significance below 0.05
+    mutate(significance = ifelse(pvalue_adjust < 0.05, "*", ""))
+  return(data_out)
+}
+```
+
+```{r, echo=FALSE}
+plot_seq_cor_time_cue = function(dt, variable){
+  # select the variable of interest, determine y-axis label and adjust axis:
+  if (variable == "mean_slope") {
+    ylabel = "Regression slope"
+    adjust_axis = 0.1
+  } else if (variable == "mean_cor") {
+    ylabel = expression("Correlation ("*tau*")")
+    adjust_axis = 1
+  } else if (variable == "mean_step") {
+    ylabel = "Mean step size"
+    adjust_axis = 1
+  }
+
+  plot = ggplot(data = dt, mapping = aes(
+    x = seq_tr, y = mean_variable, group = as.factor(as.numeric(tITI) * 1000),
+    fill = as.factor(as.numeric(tITI) * 1000))) +
+    geom_hline(aes(yintercept = 0), linetype = "solid", color = "gray") +
+    geom_ribbon(aes(ymin = sem_lower, ymax = sem_upper), alpha = 0.5, color = NA) +
+    geom_line(mapping = aes(color = as.factor(as.numeric(tITI) * 1000))) +
+    facet_wrap(~ cue_pos_label) +
+    xlab("Time from sequence onset (TRs)") + ylab(ylabel) +
+    scale_colour_viridis(name = "Speed (ms)", discrete = TRUE, option = "cividis") +
+    scale_fill_viridis(name = "Speed (ms)", discrete = TRUE, option = "cividis") +
+    scale_x_continuous(labels = label_fill(seq(1, 13, 1), mod = 4), breaks = seq(1, 13, 1)) +
+    guides(color = guide_legend(nrow = 1)) +
+    annotate("text", x = 1, y = -0.4 * adjust_axis, label = "1 TR = 1.25 s",
+             hjust = 0, size = rel(2)) +
+    coord_capped_cart(left = "both", bottom = "both", expand = TRUE,
+                      ylim = c(-0.4 * adjust_axis, 0.4 * adjust_axis)) +
+    theme(panel.border = element_blank(), axis.line = element_line()) +
+    theme(axis.line = element_line(colour = "black"),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_blank(),
+          panel.background = element_blank()) +
+    theme(legend.position = "top", legend.direction = "horizontal",
+        legend.justification = "center", legend.margin = margin(t = 0, r = 0, b = 0, l = 0),
+        legend.box.margin = margin(t = 0, r = 0, b = 0, l = 0)) +
+    geom_segment(aes(x = 0.05, xend = 0.05, y = 0.01 * adjust_axis, yend = 0.4 * adjust_axis),
+                 arrow = arrow(length = unit(5, "pt")), color = "darkgray") +
+    geom_segment(aes(x = 0.05, xend = 0.05, y = -0.01 * adjust_axis, yend = -0.4 * adjust_axis),
+                 arrow = arrow(length = unit(5, "pt")), color = "darkgray") +
+    annotate(geom = "text", x = 0.6, y = 0.2 * adjust_axis, label = "Forward",
+             color = "darkgray", angle = 90, size = 2) +
+    annotate(geom = "text", x = 0.6, y = -0.2 * adjust_axis, label = "Backward",
+             color = "darkgray", angle = 90, size = 2)
+  return(plot)
+}
+```
+
+```{r}
+fig_seq_slope_time_cue = plot_seq_cor_time_cue(dt = subset(
+  seq_test_time_cue(data = dt_pred_seq_cor_cue, variable = "mean_slope"),
+  classification == "ovr"), variable = "mean_slope")
+fig_seq_slope_time_cue
+```
+
+### Correlation of regression time courses
+
+#### Correlation between participants
+
+We calculate the correlations between the predicted and the observed time courses *between* participants for each of the five speed conditions (inter-stimulus intervals):
+
+```{r, echo=TRUE}
+# observed time courses:
+dt_data_between = seq_test_time(
+  data = dt_pred_seq_cor, variable = "mean_slope") %>%
+  filter(classification == "ovr") %>%
+  transform(tITI = as.factor(as.numeric(tITI) * 1000)) %>%
+  setorder(classification, tITI, seq_tr)
+# predicted time courses:
+dt_model_between = dt_odd_seq_sim_diff %>%
+  transform(time = time + 1) %>%
+  filter(time %in% seq(1, 13, 1)) %>%
+  setorder(classification, speed, time)
+# combine in one data table:
+dt_between = data.table(
+  speed = dt_data_between$tITI,
+  tr = dt_data_between$seq_tr,
+  empirical = dt_data_between$mean_variable,
+  prediction = dt_model_between$mean_difference)
+# calculate the correlation between 
+dt_between_results = dt_between %>%
+  .[, by = .(speed), {
+    cor = cor.test(empirical, prediction, method = "pearson")
+    list(
+      num_trs = .N,
+      pvalue = cor$p.value,
+      pvalue_round = round_pvalues(cor$p.value),
+      correlation = round(cor$estimate, 2)
+    )
+  }] %>%
+  verify(num_trs == 13) %>%
+  select(-num_trs)
+# show the table with the correlations:
+rmarkdown::paged_table(dt_between_results)
+```
+
+#### Figure 3d
+
+We plot the correlations between the regression slope time courses predicted by the model vs. the observed data *between* participants:
+
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+fig_seq_cor_between = ggplot(
+  data = dt_between,
+  mapping = aes(
+    x = prediction, y = empirical, color = speed, fill = speed)) +
+  geom_point(alpha = 1) +
+  geom_smooth(method = lm, se = FALSE, alpha = 0.5, fullrange = TRUE) +
+  scale_colour_viridis(
+    name = "Speed (ms)", discrete = TRUE,
+    option = "cividis", guide = FALSE) +
+  scale_fill_viridis(
+    name = "Speed (ms)", discrete = TRUE,
+    option = "cividis", guide = FALSE) +
+  xlab("Predicted slope") +
+  ylab("Observed slope") +
+  # guides(color = guide_legend(nrow = 1)) +
+  coord_capped_cart(
+    left = "both", bottom = "both", expand = TRUE,
+    xlim = c(-0.4, 0.4), ylim = c(-0.05, 0.05)) +
+  theme(legend.position = "top",
+        legend.direction = "horizontal",
+        legend.justification = "center",
+        legend.margin = margin(t = 0, r = 0, b = 0, l = 0),
+        legend.box.margin = margin(t = 0, r = 0, b = 0, l = 0)) +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank())
+# show the plot:
+fig_seq_cor_between
+```
+
+#### Source Data File Fig. 3d
+
+```{r, echo=TRUE}
+dt_between %>%
+  write.csv(., file = file.path(path_sourcedata, "source_data_figure_3d.csv"),
+            row.names = FALSE)
+```
+
+#### Correlation within participants
+
+We calculate the correlations between the predicted and the observed time courses *within* participants for each of the five speed conditions (inter-stimulus intervals):
+
+```{r}
+# observed regression slope time courses 
+dt_data_within = dt_pred_seq_cor %>%
+  filter(classification == "ovr") %>%
+  transform(tITI = as.factor(as.numeric(tITI) * 1000)) %>%
+  setorder(classification, id, tITI, seq_tr)
+
+# predicted regression slope time courses 
+dt_model_within = dt_odd_seq_sim %>%
+  transform(time = time + 1) %>%
+  filter(time %in% seq(1, 13, 1)) %>%
+  setorder(classification, id, speed, time)
+
+# combine in one data table:
+dt_within = data.table(
+  id = dt_data_within$id,
+  speed = dt_data_within$tITI,
+  time = dt_data_within$seq_tr,
+  empirical = dt_data_within$mean_slope,
+  prediction = dt_model_within$probability)
+
+# run correlations:
+dt_within_cor = dt_within %>%
+  .[, by = .(id, speed), {
+    cor = cor.test(empirical, prediction, method = "pearson")
+    list(
+      num_trs = .N,
+      pvalue = cor$p.value,
+      estimate = as.numeric(cor$estimate)
+    )}] %>%
+  verify(num_trs == 13)
+
+# run t-tests over correlation coefficients for each speed level:
+dt_within_cor_results = setDT(dt_within_cor) %>%
+  .[, by = .(speed), {
+    ttest_results = t.test(
+      estimate, mu = 0, alternative = "two.sided", paired = FALSE)
+    list(
+      num_subs = .N,
+      mean_estimate = round(mean(estimate), 2),
+      pvalue = ttest_results$p.value,
+      tvalue = round(ttest_results$statistic, 2),
+      df = ttest_results$parameter,
+      cohens_d = round((mean(estimate) - 0)/sd(estimate), 2)
+    )}] %>%
+  verify(num_subs == 36) %>%
+  verify((num_subs - df) == 1) %>%
+  # adjust p-values for multiple comparisons:
+  # check if the number of comparisons matches expectations:
+  .[, ":=" (
+    num_comp = .N,
+    pvalue_adjust = p.adjust(pvalue, method = "fdr", n = .N)
+  )] %>%
+  # round the original p-values according to the apa standard:
+  mutate(pvalue_round = round_pvalues(pvalue)) %>%
+  # round the adjusted p-value:
+  mutate(pvalue_adjust_round = round_pvalues(pvalue_adjust)) %>%
+  # create new variable indicating significance below 0.05
+  mutate(significance = ifelse(pvalue_adjust < 0.05, "*", ""))
+# show the table with the t-test results:
+rmarkdown::paged_table(dt_within_cor_results)
+```
+
+#### Figure 3e
+
+We plot the correlations between the predicted and the observed time courses *within* participants for each of the five speed conditions (inter-stimulus intervals):
+
+```{r, echo=TRUE}
+fig_seq_cor_within = ggplot(
+  data = dt_within_cor, 
+  mapping = aes(
+    x = speed, y = estimate, color = speed, fill = speed, group = speed)) +
+  stat_summary(geom = "bar", fun = "mean") +
+  geom_dotplot(binaxis = "y", stackdir = "center", stackratio = 0.5,
+               color = "white", alpha = 0.5,
+               inherit.aes = TRUE, binwidth = 0.05) +
+  stat_summary(geom = "errorbar", fun.data = "mean_se", width = 0, color = "black") +
+  scale_colour_viridis(
+    name = "Speed (ms)", discrete = TRUE, option = "cividis", guide = FALSE) +
+  scale_fill_viridis(
+    name = "Speed (ms)", discrete = TRUE, option = "cividis", guide = FALSE) +
+  xlab("Speed (in ms)") +
+  ylab("Correlation (r)") +
+  #guides(color = guide_legend(nrow = 1)) +
+  coord_capped_cart(left = "both", bottom = "both", expand = TRUE) +
+  theme(legend.position = "top", legend.direction = "horizontal",
+        legend.justification = "center", legend.margin = margin(t = 0, r = 0, b = 0, l = 0),
+        legend.box.margin = margin(t = 0, r = 0, b = 0, l = 0)) +
+  theme(axis.ticks.x = element_line(colour = "white"),
+        axis.line.x = element_line(colour = "white")) +
+  theme(axis.title.x = element_blank(), axis.text.x = element_blank()) +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank())
+# show figure:
+fig_seq_cor_within
+```
+
+#### Source Data File Fig. 3e
+
+```{r, echo=TRUE}
+dt_within_cor %>%
+  select(-num_trs, -pvalue) %>%
+  write.csv(., file = file.path(path_sourcedata, "source_data_figure_3e.csv"),
+            row.names = FALSE)
+```
+
+### Regression slope means
+
+Calculate the average correlation or average regression slope
+for each time period (forward versus backward) for all five speed conditions:
+
+```{r, echo=TRUE}
+seq_test_period <- function(data, variable){
+  data_out = data %>%
+    # filter out the excluded time period (select only forward and backward period):
+    filter(period != "excluded") %>%
+    setDT(.) %>%
+    # average for each time period and speed condition for every participant:
+    .[, by = .(classification, id, tITI, period), .(
+      mean_variable = mean(get(variable)))] %>%
+    # average across participants for every speed at every TR:
+    # check if the number of participants matches:
+    .[, by = .(classification, tITI, period), {
+      # perform a two-sided one-sample t-test against zero (baseline):
+      ttest_results = t.test(mean_variable, alternative = "two.sided", mu = 0);
+      list(
+        num_subs = .N,
+        mean_variable = mean(mean_variable),
+        pvalue = ttest_results$p.value,
+        tvalue = round(abs(ttest_results$statistic), 2),
+        df = ttest_results$parameter,
+        cohens_d = abs(round((mean(mean_variable) - 0) / sd(mean_variable), 2)),
+        sem_upper = mean(mean_variable) + (sd(mean_variable)/sqrt(.N)),
+        sem_lower = mean(mean_variable) - (sd(mean_variable)/sqrt(.N))
+      )
+    }] %>%
+    verify(all(num_subs == 36)) %>%
+    verify(all((num_subs - df) == 1)) %>%
+    # adjust p-values for multiple comparisons:
+    # check if the number of comparisons matches expectations:
+    .[period %in% c("forward", "backward"), by = .(classification), ":=" (
+      num_comp = .N,
+      pvalue_adjust = p.adjust(pvalue, method = "fdr", n = .N)
+    )] %>%
+    verify(num_comp == 10) %>%
+    # add variable that indicates significance with stupid significance stars:
+    mutate(significance = ifelse(pvalue < 0.05, "*", "")) %>%
+    # round the original p-values according to APA manual:
+    mutate(pvalue_round = round_pvalues(pvalue)) %>%
+    # round the adjusted p-value:
+    mutate(pvalue_adjust_round = round_pvalues(pvalue_adjust)) %>%
+    # sort data table:
+    setorder(classification, period, tITI) %>%
+    # shorten the period name:
+    mutate(period_short = ifelse(period == "forward", "fwd", period)) %>%
+    transform(period_short = ifelse(period == "backward", "bwd", period_short)) %>%
+    mutate(color = ifelse(period_short == "fwd", "dodgerblue", "red")) %>% setDT(.)
+  return(data_out)
+}
+```
+
+```{r}
+rmarkdown::paged_table(
+  seq_test_period(data = dt_pred_seq_cor, variable = "mean_cor") %>%
+  filter(pvalue_adjust < 0.05, classification == "ovr"))
+rmarkdown::paged_table(
+  seq_test_period(data = dt_pred_seq_cor, variable = "mean_step") %>%
+  filter(pvalue_adjust < 0.05, classification == "ovr"))
+rmarkdown::paged_table(
+  seq_test_period(data = dt_pred_seq_cor, variable = "mean_slope") %>%
+  filter(pvalue_adjust < 0.05, classification == "ovr"))
+```
+
+#### Figure 3c
+
+```{r, echo=TRUE}
+plot_seq_cor_period = function(data, variable){
+
+  # select the variable of interest, determine y-axis label and adjust axis:
+  if (variable == "mean_slope") {
+    ylabel = "Regression slope"
+    adjust_axis = 0.1
+  } else if (variable == "mean_cor") {
+    ylabel = expression("Correlation ("*tau*")")
+    adjust_axis = 1
+  } else if (variable == "mean_step") {
+    ylabel = "Mean step size"
+    adjust_axis = 1
+  }
+
+  dt_forward = data.table(xmin = 0, xmax = 5.5, ymin = 0, ymax = 0.4 * adjust_axis)
+  dt_backward = data.table(xmin = 0, xmax = 5.5, ymin = 0, ymax = -0.4 * adjust_axis)
+
+  # average across participants for every speed at every TR:
+  plot_data = data %>% setDT(.) %>%
+    .[, by = .(classification, id, tITI, period_short), .(
+      mean_variable = mean(get(variable))
+    )] %>% filter(classification == "ovr" & period_short != "excluded")
+  plot_stat = seq_test_period(data = data, variable = variable)
+
+  # plot average correlation or betas for each speed condition and time period:
+  plot = ggplot(data = plot_data, aes(
+    x = fct_rev(as.factor(period_short)), y = as.numeric(mean_variable),
+    fill = as.factor(as.numeric(tITI) * 1000))) +
+    geom_bar(stat = "summary", fun = "mean", width = 0.9, show.legend = TRUE) +
+    geom_dotplot(binaxis = "y", stackdir = "center", stackratio = 0.5, alpha = 0.2,
+                 binwidth = 0.01 * adjust_axis, show.legend = FALSE) +
+    #geom_point(position = position_jitterdodge(jitter.height = 0, seed = 4, jitter.width = 0.2),
+    #  pch = 21, alpha = 0.2, show.legend = FALSE) +
+    geom_errorbar(stat = "summary", fun.data = "mean_se", width = 0.0, color = "black") +
+    geom_text(data = subset(plot_stat, classification == "ovr"), aes(
+      x = fct_rev(as.factor(period_short)), y = round_updown(as.numeric(mean_variable), 0.6 * adjust_axis),
+      label = paste0("d=", sprintf("%.2f", cohens_d), significance)), size = 3.3, show.legend = FALSE,
+      color = subset(plot_stat, classification == "ovr")$color) +
+    facet_wrap(~ as.factor(as.numeric(tITI) * 1000), strip.position = "bottom", nrow = 1) +
+    xlab("Period") + ylab(ylabel) +
+    scale_fill_viridis(name = "Speed (ms)", discrete = TRUE, option = "cividis") +
+    coord_capped_cart(left = "both", bottom = "both", expand = TRUE, ylim = c(-0.6, 0.6) * adjust_axis) +
+    theme(panel.border = element_blank(), axis.line = element_line()) +
+    theme(axis.line = element_line(colour = "black"),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_blank(),
+          panel.background = element_blank()) +
+    theme(axis.ticks.x = element_line(color = "white"),
+          axis.line.x = element_line(color = "white")) +
+    theme(legend.position = "top", legend.direction = "horizontal", legend.box = "vertical",
+        legend.justification = "center", legend.margin = margin(t = 0, r = 0, b = 0, l = 0),
+        legend.box.margin = margin(t = 0, r = 0, b = -5, l = 0)) +
+    theme(panel.spacing = unit(0, "lines"), strip.background = element_blank(),
+          strip.placement = "outside", strip.text = element_blank())
+  return(plot)
+
+}
+fig_seq_cor_period = plot_seq_cor_period(data = dt_pred_seq_cor, variable = "mean_cor")
+fig_seq_slope_period = plot_seq_cor_period(data = dt_pred_seq_cor, variable = "mean_slope")
+fig_seq_step_period = plot_seq_cor_period(data = dt_pred_seq_cor, variable = "mean_step")
+fig_seq_cor_period; fig_seq_step_period; fig_seq_slope_period;
+```
+
+#### Source Data File Fig. 3e / S5b / S5d
+
+```{r}
+dt_pred_seq_cor %>%
+  select(-classification, -num_trials, -color) %>%
+  write.csv(., file = file.path(path_sourcedata, "source_data_figure_3c.csv"),
+            row.names = FALSE)
+dt_pred_seq_cor %>%
+  select(-classification, -num_trials, -color) %>%
+  write.csv(., file = file.path(path_sourcedata, "source_data_figure_s5b.csv"),
+            row.names = FALSE)
+dt_pred_seq_cor %>%
+  select(-classification, -num_trials, -color) %>%
+  write.csv(., file = file.path(path_sourcedata, "source_data_figure_s5d.csv"),
+            row.names = FALSE)
+```
+
+#### Source Data File Fig. S5b
+
+```{r}
+dt_pred_seq_cor %>%
+  select(-classification, -num_trials) %>%
+  write.csv(., file = file.path(path_sourcedata, "source_data_figure_3c.csv"),
+            row.names = FALSE)
+```
+
+#### Source Data File Fig. S5c
+
+```{r}
+dt_pred_seq_cor %>%
+  select(-classification, -num_trials) %>%
+  write.csv(., file = file.path(path_sourcedata, "source_data_figure_3c.csv"),
+            row.names = FALSE)
+```
+
+```{r, echo = FALSE}
+plot_seq_cor_facet = function(dt, variable){
+
+  # create separate datatable to plot rectangles indicating forward / backward period:
+  dt_reduced = dt %>% setDT(.) %>%
+    .[, by = .(classification, tITI, period), .(
+      xmin = min(seq_tr) - 0.5,
+      xmax = max(seq_tr) + 0.5
+    )] %>%
+    filter(period != "excluded") %>%
+    mutate(fill = ifelse(period == "forward", "dodgerblue", "red"))
+
+  # select the variable of interest, determine y-axis label and adjust axis:
+  if (variable == "mean_slope") {
+    ylabel = "Regression slope"
+    adjust_axis = 0.1
+  } else if (variable == "mean_cor") {
+    ylabel = expression("Correlation ("*tau*")")
+    adjust_axis = 1
+  } else if (variable == "mean_step") {
+    ylabel = "Mean step size"
+    adjust_axis = 1
+  }
+
+  plot = ggplot(data = dt, mapping = aes(
+    x = as.factor(seq_tr), y = as.numeric(mean_variable),
+    group = as.factor(tITI), fill = as.factor(tITI), color = as.factor(tITI))) +
+    # add background rectangles to indicate the forward and backward period:
+    geom_rect(data = dt_reduced, aes(
+      xmin = xmin, xmax = xmax, ymin = -0.4 * adjust_axis, ymax = 0.4 * adjust_axis),
+      alpha = 0.05, inherit.aes = FALSE, show.legend = FALSE, fill = dt_reduced$fill) +
+    geom_hline(aes(yintercept = 0), linetype = "solid", color = "gray") +
+    facet_wrap(facets = ~ as.factor(tITI), labeller = get_labeller(dt$tITI), nrow = 1) +
+    geom_ribbon(aes(ymin = sem_lower, ymax = sem_upper), alpha = 0.5, color = NA) +
+    geom_line() +
+    geom_point(data = subset(dt, pvalue_adjust < 0.05), pch = 21, fill = "red",
+               color = "black", show.legend = FALSE) +
+    xlab("Time from sequence onset (TRs)") + ylab(ylabel) +
+    theme(legend.position = "top", legend.direction = "horizontal",
+          legend.justification = "center", legend.margin = margin(0, 0, 0, 0),
+          legend.box.margin = margin(t = 0, r = 0, b = -5, l = 0)) +
+    scale_colour_viridis(name = "Speed (ms)", discrete = TRUE, option = "cividis", guide = FALSE) +
+    scale_fill_viridis(name = "Speed (ms)", discrete = TRUE, option = "cividis", guide = FALSE) +
+    scale_x_discrete(labels = label_fill(seq(1, 13, 1), mod = 4), breaks = seq(1, 13, 1)) +
+    theme(strip.text.x = element_text(margin = margin(b = 2, t = 2))) +
+    coord_capped_cart(left = "both", bottom = "both", expand = TRUE, ylim = c(-0.4, 0.4) * adjust_axis) +
+    theme(axis.line = element_line(colour = "black"),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_blank(),
+          panel.background = element_blank())
+  return(plot)
+}
+```
+
+We repeat the same calculations, just splitting up the data by the serial position of the cued image:
+
+```{r}
+seq_test_period_cue <- function(data, variable){
+  data_out = data %>%
+    # filter out the excluded time period (select only forward and backward period):
+    filter(period != "excluded") %>% setDT(.) %>%
+    # average for each time period and speed condition for every participant:
+    .[, by = .(classification, id, tITI, period, cue_pos_label), .(
+      mean_variable = mean(get(variable)))] %>%
+    # average across participants for every speed at every TR:
+    # check if the number of participants matches:
+    .[, by = .(classification, tITI, period, cue_pos_label), {
+      # perform a two-sided one-sample t-test against zero (baseline):
+      ttest_results = t.test(mean_variable, alternative = "two.sided", mu = 0);
+      list(
+        num_subs = .N,
+        mean_variable = mean(mean_variable),
+        pvalue = ttest_results$p.value,
+        tvalue = round(abs(ttest_results$statistic), 2),
+        df = ttest_results$parameter,
+        cohens_d = abs(round((mean(mean_variable) - 0) / sd(mean_variable), 2)),
+        sem_upper = mean(mean_variable) + (sd(mean_variable)/sqrt(.N)),
+        sem_lower = mean(mean_variable) - (sd(mean_variable)/sqrt(.N))
+      )
+    }] %>% verify(all(num_subs == 36)) %>% verify(all((num_subs - df) == 1)) %>%
+    # adjust p-values for multiple comparisons:
+    # check if the number of comparisons matches expectations:
+    .[period %in% c("forward", "backward"), by = .(classification), ":=" (
+      num_comp = .N,
+      pvalue_adjust = p.adjust(pvalue, method = "fdr", n = .N)
+    )] %>% #verify(num_comp == 10) %>%
+    # add variable that indicates significance with stupid significance stars:
+    mutate(significance = ifelse(pvalue < 0.05, "*", "")) %>%
+    # round the original p-values according to APA manual:
+    mutate(pvalue_round = round_pvalues(pvalue)) %>%
+    # round the adjusted p-value:
+    mutate(pvalue_adjust_round = round_pvalues(pvalue_adjust)) %>%
+    # sort data table:
+    setorder(classification, period, tITI) %>%
+    # shorten the period name:
+    mutate(period_short = ifelse(period == "forward", "fwd", period)) %>%
+    transform(period_short = ifelse(period == "backward", "bwd", period_short)) %>%
+    mutate(color = ifelse(period_short == "fwd", "dodgerblue", "red")) %>% setDT(.)
+  return(data_out)
+}
+```
+
+```{r}
+rmarkdown::paged_table(
+  seq_test_period_cue(data = dt_pred_seq_cor_cue, variable = "mean_cor") %>%
+  filter(pvalue_adjust < 0.05, classification == "ovr"))
+rmarkdown::paged_table(
+  seq_test_period_cue(data = dt_pred_seq_cor_cue, variable = "mean_step") %>%
+  filter(pvalue_adjust < 0.05, classification == "ovr"))
+rmarkdown::paged_table(
+  seq_test_period_cue(data = dt_pred_seq_cor_cue, variable = "mean_slope") %>%
+  filter(pvalue_adjust < 0.05, classification == "ovr"))
+```
+
+We plot the same data, just splitting up the data by the serial position of the cued image:
+
+```{r}
+plot_seq_cor_period_cue = function(data, variable){
+
+  # select the variable of interest, determine y-axis label and adjust axis:
+  if (variable == "mean_slope") {
+    ylabel = "Regression slope"
+    adjust_axis = 0.1
+  } else if (variable == "mean_cor") {
+    ylabel = expression("Correlation ("*tau*")")
+    adjust_axis = 1
+  } else if (variable == "mean_step") {
+    ylabel = "Mean step size"
+    adjust_axis = 1
+  }
+
+  dt_forward = data.table(xmin = 0, xmax = 5.5, ymin = 0, ymax = 0.4 * adjust_axis)
+  dt_backward = data.table(xmin = 0, xmax = 5.5, ymin = 0, ymax = -0.4 * adjust_axis)
+
+  # average across participants for every speed at every TR:
+  plot_data = data %>% setDT(.) %>%
+    .[, by = .(classification, id, tITI, period_short, cue_pos_label), .(
+      mean_variable = mean(get(variable))
+    )] %>% filter(classification == "ovr" & period_short != "excluded")
+  plot_stat = seq_test_period_cue(data = data, variable = variable)
+
+  # plot average correlation or betas for each speed condition and time period:
+  plot = ggplot(data = plot_data, aes(
+    x = fct_rev(as.factor(period_short)), y = as.numeric(mean_variable),
+    fill = as.factor(as.numeric(tITI) * 1000))) +
+    geom_bar(stat = "summary", fun = "mean", width = 0.9, show.legend = TRUE) +
+    geom_dotplot(binaxis = "y", stackdir = "center", stackratio = 0.5, alpha = 0.2,
+                 binwidth = 0.01 * adjust_axis, show.legend = FALSE) +
+    geom_errorbar(stat = "summary", fun.data = "mean_se", width = 0.0, color = "black") +
+    geom_text(data = subset(plot_stat, classification == "ovr"), aes(
+      x = fct_rev(as.factor(period_short)), y = round_updown(as.numeric(mean_variable), 0.5 * adjust_axis),
+      label = paste0("d=", cohens_d, significance)), size = 3.0, show.legend = FALSE,
+      color = subset(plot_stat, classification == "ovr")$color) +
+    facet_grid(rows = vars(cue_pos_label),
+               cols = vars(as.factor(as.numeric(tITI) * 1000))) +
+    xlab("Period") + ylab(ylabel) +
+    scale_fill_viridis(name = "Speed (ms)", discrete = TRUE, option = "cividis") +
+    coord_capped_cart(left = "both", bottom = "both", expand = TRUE, ylim = c(-0.6, 0.6) * adjust_axis) +
+    theme(panel.border = element_blank(), axis.line = element_line()) +
+    theme(axis.line = element_line(colour = "black"),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_blank(),
+          panel.background = element_blank()) +
+    #theme(axis.ticks.x = element_blank(), axis.line.x = element_blank()) +
+    theme(legend.position = "top", legend.direction = "horizontal", legend.box = "vertical",
+        legend.justification = "center", legend.margin = margin(t = 0, r = 0, b = 0, l = 0),
+        legend.box.margin = margin(t = 0, r = 0, b = -5, l = 0))
+    #theme(panel.spacing = unit(0, "lines"), strip.background = element_blank(),
+    #      strip.placement = "outside", strip.text = element_blank())
+  return(plot)
+
+}
+
+fig_seq_cor_period_cue = plot_seq_cor_period_cue(data = dt_pred_seq_cor_cue, variable = "mean_cor")
+fig_seq_slope_period_cue = plot_seq_cor_period_cue(data = dt_pred_seq_cor_cue, variable = "mean_slope")
+fig_seq_step_period_cue = plot_seq_cor_period_cue(data = dt_pred_seq_cor_cue, variable = "mean_step")
+fig_seq_cor_period_cue; fig_seq_step_period_cue; fig_seq_slope_period_cue;
+```
+
+Combine plots for cue period:
+
+```{r, echo=FALSE}
+plot_grid(fig_seq_probas_cue, fig_seq_slope_time_cue, fig_seq_slope_period_cue,
+          labels = c("a", "b", "c"), nrow = 3, rel_heights = c(5, 4, 6))
+```
+
+```{r, echo=FALSE, eval=FALSE, include=FALSE}
+ggsave(filename = "highspeed_plot_decoding_sequence_cue_effects.pdf",
+       plot = last_plot(), device = cairo_pdf, path = path_figures, scale = 1,
+       dpi = "retina", width = 6, height = 10)
+```
+
+
+```{r}
+# create a data frame with the relevant data to run the LME:
+lme_seq_cor_data = dt_pred_seq_cor %>%
+  filter(classification == "ovr" & period != "excluded") %>%
+  transform(tITI = as.factor(tITI))
+# define linear mixed effects model with by-participant random intercepts:
+lme_seq_cor = lmer(mean_slope ~ tITI * period + (1|id),
+                   data = lme_seq_cor_data, na.action = na.omit, control = lcctrl)
+summary(lme_seq_cor)
+anova(lme_seq_cor)
+emmeans_results = emmeans(lme_seq_cor, list(pairwise ~ period | tITI))
+emmeans_pvalues = round_pvalues(summary(emmeans_results[[2]])$p.value)
+```
+
+### Serial target position
+
+We calculate the average serial position at each TR:
+
+```{r}
+dt_pred_seq_pos = dt_pred_seq %>%
+  # get the position with the highest probability at every TR:
+  .[, by = .(classification, id, period, tITI, trial_tITI, seq_tr), .(
+    num_positions = .N,
+    max_position = position[which.max(probability_norm)]
+  )] %>%
+  # verify that the number of position per TR matches:
+  verify(all(num_positions == 5)) %>%
+  # average the maximum position across trials for each speed condition:
+  .[, by = .(classification, id, period, tITI, seq_tr), .(
+    num_trials = .N,
+    mean_position = mean(max_position)
+  )] %>%
+  # verify that the number of trials per participant is correct:
+  verify(all(num_trials == 15)) %>%
+  # calculate the difference of the mean position from baseline (which is 3)
+  mutate(position_diff = mean_position - 3) %>%
+  setDT(.) %>%
+  # set the speed condition and period variable to a factorial variable:
+  transform(tTII = as.factor(tITI)) %>%
+  transform(period = as.factor(period))
+```
+
+We calculate whether the average serial position is significantly different
+from baseline separately for every speed and period (forward vs. backward):
+
+```{r}
+dt_pred_seq_pos_period = dt_pred_seq_pos %>%
+  # focus on the forward and backward period only:
+  filter(period != "excluded") %>% setDT(.) %>%
+  # average the mean position across trs for each period and speed condition:
+  .[, by = .(classification, id, period, tITI), .(
+    position_diff = mean(position_diff)
+  )] %>%
+  # average across participants for each speed condition and volume:
+  .[, by = .(classification, period, tITI), {
+    ttest_results = t.test(position_diff, alternative = "two.sided", mu = 0)
+    list(
+      num_subs = .N,
+      tvalue = round(ttest_results$statistic, 2),
+      pvalue = ttest_results$p.value,
+      df = ttest_results$parameter,
+      cohens_d = abs(round((mean(position_diff) - 0) / sd(position_diff), 2)),
+      position_diff = mean(position_diff),
+      conf_lb = round(ttest_results$conf.int[1], 2),
+      conf_ub = round(ttest_results$conf.int[2], 2),
+      sd_position = sd(position_diff),
+      sem_upper = mean(position_diff) + (sd(position_diff)/sqrt(.N)),
+      sem_lower = mean(position_diff) - (sd(position_diff)/sqrt(.N))
+    )
+  }] %>% verify(all(num_subs == 36)) %>%
+  # adjust p-values for multiple comparisons:
+  .[, by = .(classification), ":=" (
+    num_comp = .N,
+    pvalue_adjust = p.adjust(pvalue, method = "fdr", n = .N)
+  )] %>%
+  verify(all(num_comp == 10)) %>%
+  # add variable that indicates significance with stupid significance stars:
+  mutate(significance = ifelse(pvalue_adjust < 0.05, "*", "")) %>%
+  # round the original p-values:
+  mutate(pvalue_round = round_pvalues(pvalue)) %>%
+  # round the p-values adjusted for multiple comparisons:
+  mutate(pvalue_adjust_round = round_pvalues(pvalue_adjust)) %>%
+  # sort the datatable for each speed and TR:
+  setorder(., classification, period, tITI) %>%
+  # shorten the period name:
+  mutate(period_short = ifelse(period == "forward", "fwd", period)) %>%
+  transform(period_short = ifelse(period == "backward", "bwd", period_short))  %>%
+  mutate(color = ifelse(period_short == "fwd", "dodgerblue", "red")) %>% setDT(.)
+
+dt_pred_seq_pos_period %>%
+  filter(classification == "ovr", pvalue_adjust < 0.05) %>%
+  rmarkdown::paged_table(.)
+```
+
+We calculate the mean serial position at every TR and compare it against baseline:
+
+```{r}
+dt_pred_seq_pos_tr = dt_pred_seq_pos %>%
+  # average across participants for each speed condition and volume:
+  .[, by = .(classification, period, tITI, seq_tr), {
+    ttest_results = t.test(mean_position, alternative = "two.sided", mu = 3)
+    list(
+      num_subs = .N,
+      tvalue = ttest_results$statistic,
+      pvalue = ttest_results$p.value,
+      df = ttest_results$parameter,
+      mean_position = mean(mean_position),
+      sd_position = sd(mean_position),
+      sem_upper = mean(mean_position) + (sd(mean_position)/sqrt(.N)),
+      sem_lower = mean(mean_position) - (sd(mean_position)/sqrt(.N))
+    )
+  }] %>% verify(all(num_subs == 36)) %>%
+  # adjust p-values for multiple comparisons:
+  .[period %in% c("forward", "backward"), by = .(classification), ":=" (
+    num_comp = .N,
+    pvalue_adjust = p.adjust(pvalue, method = "fdr", n = .N)
+  )] %>% verify(all(num_comp == 39, na.rm = TRUE)) %>%
+  # round the original p-values:
+  mutate(pvalue_rounded = round_pvalues(pvalue)) %>%
+  # round the p-values adjusted for multiple comparisons:
+  mutate(pvalue_adjust_rounded = round_pvalues(pvalue_adjust)) %>%
+  #
+  mutate(significance = ifelse(pvalue_adjust < 0.05, "***", "")) %>%
+  # sort the datatable for each speed and TR:
+  setorder(., classification, period, tITI, seq_tr)
+
+dt_pred_seq_pos_tr %>%
+  filter(classification == "ovr", pvalue_adjust < 0.05) %>%
+  rmarkdown::paged_table(.)
+```
+
+```{r, eval = FALSE, echo=TRUE}
+cfg = list(variable = "mean_position", threshold = 2.021, baseline = 3,
+  grouping = c("classification", "tITI"), n_perms = 10000, n_trs = 13)
+dt_pred_seq_pos_cluster = cluster_permutation(dt_pred_seq_pos_sub, cfg)
+```
+
+```{r}
+# define linear mixed effects model with by-participant random intercepts:
+lme_seq_pos = lmer(position_diff ~ tITI * period + (1 + tITI + period |id),
+      data = subset(dt_pred_seq_pos, classification == "ovr" & period != "excluded"),
+      na.action = na.omit, control = lcctrl)
+summary(lme_seq_pos)
+anova(lme_seq_pos)
+emmeans_results = emmeans(lme_seq_pos, list(pairwise ~ period | tITI))
+emmeans_pvalues = round_pvalues(summary(emmeans_results[[2]])$p.value)
+```
+
+#### Figure 3g
+
+```{r, echo=TRUE}
+variable = "position_diff"
+plot_data = dt_pred_seq_pos %>%
+  # average across participants for every speed at every TR:
+  .[, by = .(classification, id, tITI, period), .(
+    mean_variable = mean(get(variable))
+  )] %>%
+  filter(classification == "ovr" & period != "excluded") %>%
+  # shorten the period name:
+  mutate(period_short = ifelse(period == "forward", "fwd", period)) %>%
+  transform(period_short = ifelse(period == "backward", "bwd", period_short)) %>%
+  mutate(color = ifelse(period_short == "fwd", "dodgerblue", "red")) %>% 
+  setDT(.)
+
+# plot average correlation or betas for each speed condition and time period:
+fig_seq_pos_period = ggplot(data = plot_data, aes(
+  x = fct_rev(as.factor(period_short)), y = as.numeric(mean_variable),
+  fill = as.factor(as.numeric(tITI) * 1000))) +
+  geom_bar(stat = "summary", fun = "mean", width = 0.9, show.legend = TRUE) +
+  geom_dotplot(binaxis = "y", stackdir = "center", stackratio = 0.5, alpha = 0.2,
+                 binwidth = 0.05, show.legend = FALSE) +
+  geom_errorbar(stat = "summary", fun.data = "mean_se", width = 0.0, color = "black") +
+  geom_text(data = subset(dt_pred_seq_pos_period, classification == "ovr"), aes(
+    x = fct_rev(as.factor(period_short)), y = round_updown(as.numeric(get(variable)), 1.2),
+    label = paste0("d=", sprintf("%.2f", cohens_d), significance)), show.legend = FALSE, size = 3.2,
+    color = subset(dt_pred_seq_pos_period, classification == "ovr")$color) +
+  facet_wrap(~ as.factor(as.numeric(tITI) * 1000), strip.position = "bottom", nrow = 1) +
+  xlab("Period") + ylab("Event position\ncompared to baseline") +
+  scale_colour_viridis(name = "Speed (ms)", discrete = TRUE, option = "cividis") +
+  scale_fill_viridis(name = "Speed (ms)", discrete = TRUE, option = "cividis") +
+  coord_capped_cart(left = "both", bottom = "both", expand = TRUE, ylim = c(-1.5, 1.5)) +
+  theme(legend.position = "top", legend.direction = "horizontal",
+        legend.justification = "center", legend.margin = margin(t = 0, r = 0, b = 0, l = 0),
+        legend.box.margin = margin(t = 0, r = 0, b = 0, l = 0)) +
+  theme(panel.spacing = unit(0, "lines"), strip.background = element_blank(),
+        strip.placement = "outside", strip.text = element_blank()) +
+  theme(axis.ticks.x = element_line(colour = "white"),
+        axis.line.x = element_line(colour = "white")) +
+  theme(axis.line.y = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank())
+fig_seq_pos_period
+```
+```{r, echo=FALSE, eval=FALSE, include=FALSE}
+ggsave(filename = "highspeed_plot_decoding_sequence_position_period.pdf",
+       plot = last_plot(), device = cairo_pdf, path = path_figures, scale = 1,
+       dpi = "retina", width = 5, height = 3)
+```
+
+#### Source Data File Fig. 3g
+
+```{r, echo=TRUE}
+subset(plot_data, classification == "ovr") %>%
+  select(-classification, -color) %>%
+  write.csv(., file = file.path(path_sourcedata, "source_data_figure_3g.csv"),
+            row.names = FALSE)
+```
+
+#### Figure 3f
+
+```{r, echo = FALSE}
+plot_seq_pos <- function(dt){
+  # create separate datatable to plot rectangles indicating forward / backward period:
+  dt_reduced = dt %>% setDT(.) %>%
+    .[, by = .(classification, tITI, period), .(
+      xmin = min(seq_tr) - 0.5,
+      xmax = max(seq_tr) + 0.5
+    )] %>%
+    filter(period != "excluded") %>%
+    mutate(fill = ifelse(period == "forward", "dodgerblue", "red"))
+  ggplot(data = dt, mapping = aes(
+    x = as.factor(seq_tr), y = as.numeric(mean_position),
+    group = as.factor(as.numeric(tITI)*1000), fill = as.factor(as.numeric(tITI)*1000))) +
+    #geom_rect(data = dt_reduced, aes(xmin = xmin, xmax = xmax, ymin = 2, ymax = 4),
+    #  alpha = 0.05, inherit.aes = FALSE, show.legend = FALSE, fill = dt_reduced$fill) +
+    geom_hline(aes(yintercept = 3), linetype = "solid", color = "gray") +
+    #facet_wrap(facets = ~ as.factor(tITI), labeller = get_labeller(dt$tITI), nrow = 1) +
+    geom_ribbon(aes(ymin = sem_lower, ymax = sem_upper), alpha = 0.5, color = NA) +
+    geom_line(mapping = aes(color = as.factor(as.numeric(tITI)*1000))) +
+    xlab("Time from sequence onset (TRs)") +
+    ylab("Event position") +
+    scale_colour_viridis(discrete = TRUE, option = "cividis", name = "Speed (ms)", guide = FALSE) +
+    scale_fill_viridis(discrete = TRUE, option = "cividis", name = "Speed (ms)", guide = FALSE) +
+    scale_x_discrete(labels = label_fill(seq(1, 13, 1), mod = 4), breaks = seq(1, 13, 1)) +
+    coord_capped_cart(left = "both", bottom = "both", expand = TRUE, ylim = c(2,4)) +
+    theme(strip.text.x = element_text(margin = margin(b = 2, t = 2))) +
+    theme(legend.position = "top", legend.direction = "horizontal",
+        legend.justification = "center", legend.margin = margin(t = 0, r = 0, b = 0, l = 0),
+        legend.box.margin = margin(t = 0, r = 0, b = 0, l = 0)) +
+    geom_segment(aes(x = 0.9, xend = 0.9, y = 3.01, yend = 4),
+                 arrow = arrow(length = unit(5, "pt")), color = "darkgray") +
+    geom_segment(aes(x = 0.9, xend = 0.9, y = 3.01, yend = 2),
+                 arrow = arrow(length = unit(5, "pt")), color = "darkgray") +
+    annotate(geom = "text", x = 1.4, y = 3.5, label = "Later",
+             color = "darkgray", angle = 90, size = 3) +
+    annotate(geom = "text", x = 1.4, y = 2.5, label = "Earlier",
+             color = "darkgray", angle = 90, size = 3) +
+    annotate("text", x = 13, y = 2, label = "1 TR = 1.25 s",
+             hjust = 1, size = rel(2)) +
+    theme(axis.line = element_line(colour = "black"),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_blank(),
+          panel.background = element_blank())
+}
+fig_seq_pos_time = plot_seq_pos(dt = subset(dt_pred_seq_pos_tr, classification == "ovr"))
+fig_seq_pos_time
+```
+
+#### Source Data File Fig. 3f
+
+```{r, echo=TRUE}
+subset(dt_pred_seq_pos_tr, classification == "ovr") %>%
+  select(-classification, -num_subs, -num_comp, -pvalue_adjust,
+         -pvalue_rounded, -pvalue_adjust_rounded, -pvalue, -df,
+         -tvalue, -significance, -sd_position) %>%
+  write.csv(., file = file.path(path_sourcedata, "source_data_figure_3f.csv"),
+            row.names = FALSE)
+```
+
+
+```{r, echo = FALSE}
+plot_seq_pos_facet <- function(dt){
+  # create separate datatable to plot rectangles indicating forward / backward period:
+  dt_reduced = dt %>% setDT(.) %>%
+    .[, by = .(classification, tITI, period), .(
+      xmin = min(seq_tr) - 0.5,
+      xmax = max(seq_tr) + 0.5
+    )] %>%
+    filter(period != "excluded") %>%
+    mutate(fill = ifelse(period == "forward", "dodgerblue", "red"))
+  ggplot(data = dt, mapping = aes(
+    x = as.factor(seq_tr), y = as.numeric(mean_position),
+    group = as.factor(as.numeric(tITI)*1000), fill = as.factor(as.numeric(tITI)*1000))) +
+    geom_rect(data = dt_reduced, aes(xmin = xmin, xmax = xmax, ymin = 2, ymax = 4),
+      alpha = 0.05, inherit.aes = FALSE, show.legend = FALSE, fill = dt_reduced$fill) +
+    geom_hline(aes(yintercept = 3), linetype = "solid", color = "gray") +
+    facet_wrap(facets = ~ as.factor(tITI), labeller = get_labeller(dt$tITI), nrow = 1) +
+    geom_ribbon(aes(ymin = sem_lower, ymax = sem_upper), alpha = 0.5, color = NA) +
+    geom_line(mapping = aes(color = as.factor(as.numeric(tITI)*1000))) +
+    geom_point(data = subset(dt, pvalue_adjust < 0.05), pch = 21, fill = "red",
+               color = "black", show.legend = FALSE) +
+    xlab("Time from sequence onset (TRs)") +
+    ylab("Event position") +
+    scale_colour_viridis(discrete = TRUE, option = "cividis", name = "Speed (ms)", guide = FALSE) +
+    scale_fill_viridis(discrete = TRUE, option = "cividis", name = "Speed (ms)", guide = FALSE) +
+    scale_x_discrete(labels = label_fill(seq(1, 13, 1), mod = 4), breaks = seq(1, 13, 1)) +
+    coord_capped_cart(left = "both", bottom = "both", expand = TRUE, ylim = c(2,4)) +
+    theme(strip.text.x = element_text(margin = margin(b = 2, t = 2))) +
+    theme(legend.position = "top", legend.direction = "horizontal",
+        legend.justification = "center", legend.margin = margin(t = 0, r = 0, b = 0, l = 0),
+        legend.box.margin = margin(t = 0, r = 0, b = 0, l = 0)) +
+    theme(axis.line = element_line(colour = "black"),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_blank(),
+          panel.background = element_blank())
+}
+fig_seq_pos_time_facet = plot_seq_pos_facet(dt = subset(dt_pred_seq_pos_tr, classification == "ovr"))
+fig_seq_pos_time_facet
+```
+
+
+```{r, echo=FALSE, eval=FALSE, include=FALSE}
+ggsave(filename = "highspeed_plot_decoding_sequence_timecourse_position.pdf",
+       plot = last_plot(), device = cairo_pdf, path = path_figures, scale = 1,
+       dpi = "retina", width = 6, height = 3)
+```
+
+### Transititons
+
+We calculate the step size between consecutively decoded (highest probability) events:
+
+```{r}
+dt_pred_seq_step = dt_pred_seq %>%
+  # get the position with the highest probability for every TR:
+  .[, by = .(classification, id, tITI, trial_tITI, seq_tr), ":=" (
+    num_classes = .N,
+    rank_order = rank(-probability),
+    max_prob = as.numeric(probability == max(probability))
+  )] %>%
+  # verify that there are five classes per TR:
+  verify(all(num_classes == 5)) %>%
+  # sort the data table:
+  setorder(., classification, id, tITI, trial_tITI, seq_tr) %>%
+  # select only classes with the highest probability for every TR:
+  filter(max_prob == 1) %>%
+  setDT(.) %>%
+  # check if the rank order of the event with highest probability match:
+  verify(all(rank_order == max_prob)) %>%
+  # group by classification, id, speed and trial and calculate step sizes:
+  .[, by = .(classification, id, tITI, trial_tITI),
+    step := position - shift(position)]
+```
+
+We calculate the mean step size for early and late period in the forward and backward phase:
+
+```{r}
+dt_pred_seq_step_mean = dt_pred_seq_step %>%
+  filter(period != "excluded") %>%
+  filter(!(is.na(zone))) %>% setDT(.) %>%
+  # shorten the period name:
+  mutate(period_short = ifelse(period == "forward", "fwd", period)) %>%
+  transform(period_short = ifelse(period == "backward", "bwd", period_short)) %>%
+  setDT(.) %>%
+  .[, by = .(classification, id, tITI, period_short, zone), .(
+    mean_step = mean(step, na.rm = TRUE))]
+```
+
+We compare the forward and the backward period using t-tests:
+
+```{r}
+dt_pred_seq_step_stat = dt_pred_seq_step_mean %>%
+  spread(key = period_short, value = mean_step, drop = TRUE) %>%
+  mutate(difference = fwd - bwd) %>% setDT(.) %>%
+  # average across participants for each speed condition and volume:
+  .[, by = .(classification, tITI, zone), {
+    ttest_results = t.test(fwd, bwd, alternative = "two.sided", paired = TRUE)
+    list(
+      num_subs = .N,
+      tvalue = round(ttest_results$statistic, 2),
+      pvalue = ttest_results$p.value,
+      df = ttest_results$parameter,
+      cohens_d = abs(round((mean(fwd) - mean(bwd)) / sd(fwd - bwd), 2)),
+      mean_step = mean(difference),
+      sd_step = sd(difference),
+      sem_upper = mean(difference) + (sd(difference)/sqrt(.N)),
+      sem_lower = mean(difference) - (sd(difference)/sqrt(.N))
+    )
+  }] %>% verify(all(num_subs == 36)) %>%
+  # adjust p-values for multiple comparisons:
+  .[, by = .(classification), ":=" (
+    num_comp = .N,
+    pvalue_adjust = p.adjust(pvalue, method = "fdr", n = .N)
+  )] %>%
+  verify(all(num_comp == 10)) %>%
+  # add variable that indicates significance with stupid significance stars:
+  mutate(significance = ifelse(pvalue < 0.05, "*", "")) %>%
+  # round the original p-values:
+  mutate(pvalue_round = round_pvalues(pvalue)) %>%
+  # round the p-values adjusted for multiple comparisons:
+  mutate(pvalue_adjust_round = round_pvalues(pvalue_adjust)) %>%
+  # sort the datatable for each speed and TR:
+  setorder(., classification, zone, tITI)
+
+dt_pred_seq_step_stat %>%
+  filter(classification == "ovr") %>%
+  rmarkdown::paged_table(.)
+```
+
+We compare each period to the baseline:
+
+```{r}
+dt_pred_seq_step_stat_baseline = dt_pred_seq_step_mean %>%
+  # average across participants for each speed condition and volume:
+  .[, by = .(classification, tITI, period_short, zone), {
+    ttest_results = t.test(mean_step, mu = 0, alternative = "two.sided")
+    list(
+      num_subs = .N,
+      tvalue = round(ttest_results$statistic, 2),
+      pvalue = ttest_results$p.value,
+      df = ttest_results$parameter,
+      cohens_d = abs(round((mean(mean_step) - 0) / sd(mean_step), 2)),
+      mean_step = mean(mean_step),
+      sd_step = sd(mean_step),
+      sem_upper = mean(mean_step) + (sd(mean_step)/sqrt(.N)),
+      sem_lower = mean(mean_step) - (sd(mean_step)/sqrt(.N))
+    )
+  }] %>% verify(all(num_subs == 36)) %>%
+  # adjust p-values for multiple comparisons:
+  .[, by = .(classification), ":=" (
+    num_comp = .N,
+    pvalue_adjust = p.adjust(pvalue, method = "fdr", n = .N)
+  )] %>%
+  # verf
+  verify(all(num_comp == 20)) %>%
+  # add variable that indicates significance with stupid significance stars:
+  mutate(significance = ifelse(pvalue_adjust < 0.05, "*", "")) %>%
+  # round the original p-values:
+  mutate(pvalue_round = round_pvalues(pvalue)) %>%
+  # round the p-values adjusted for multiple comparisons:
+  mutate(pvalue_adjust_round = round_pvalues(pvalue_adjust)) %>%
+  # sort the datatable for each speed and TR:
+  setorder(., classification, period_short, zone, tITI)
+
+dt_pred_seq_step_stat_baseline %>%
+  filter(classification == "ovr", pvalue < 0.05) %>%
+  rmarkdown::paged_table(.)
+```
+
+#### Figure 3h
+
+```{r}
+# plot average correlation or betas for each speed condition and time period:
+fig_seq_step = ggplot(data = subset(dt_pred_seq_step_mean, classification == "ovr"), aes(
+  x = fct_rev(as.factor(period_short)), y = as.numeric(mean_step),
+  fill = as.factor(as.numeric(tITI) * 1000)), color = as.factor(as.numeric(tITI) * 1000)) +
+  facet_grid(vars(as.factor(zone)), vars(as.factor(as.numeric(tITI) * 1000)), switch = "x") +
+  geom_bar(stat = "summary", fun = "mean", width = 0.9) +
+  geom_point(position = position_jitterdodge(jitter.height = 0, seed = 4, jitter.width = 0.2),
+    pch = 21, alpha = 0.05, color = "black", show.legend = FALSE) +
+  geom_errorbar(stat = "summary", fun.data = "mean_se", width = 0.0, color = "black") +
+  geom_text(data = subset(dt_pred_seq_step_stat, classification == "ovr"), aes(
+    y = 2, label = paste0("d=", sprintf("%.2f", cohens_d), significance), x = 1.5),
+    inherit.aes = FALSE, color = "black", size = 3.3) +
+  xlab("Period") + ylab("Step size") +
+  scale_colour_viridis(discrete = TRUE, option = "cividis", name = "Speed (ms)") +
+  scale_fill_viridis(discrete = TRUE, option = "cividis", name = "Speed (ms)") +
+  coord_capped_cart(left = "both", bottom = "both", expand = TRUE, ylim = c(-2, 2)) +
+  theme(legend.position = "top", legend.direction = "horizontal",
+        legend.justification = "center", legend.margin = margin(t = 0, r = 0, b = -5, l = 0),
+        legend.box.margin = margin(t = 0, r = 0, b = 0, l = 0)) +
+  theme(panel.spacing.x = unit(0, "lines"), strip.background.x = element_blank(),
+        strip.placement.x = "outside", strip.text.x = element_blank()) +
+  theme(axis.ticks.x = element_line(colour = "white"),
+        axis.line.x = element_line(colour = "white")) +
+  #theme(axis.title.x = element_blank()) +
+  theme(strip.text = element_text(margin = margin(b = 2, t = 2, r = 2, l = 2))) +
+  theme(axis.line.y = element_line(colour = "black"),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_blank(),
+          panel.background = element_blank())
+fig_seq_step
+```
+
+#### Source Data File Fig. 3h
+
+```{r, echo=TRUE}
+subset(dt_pred_seq_step_mean, classification == "ovr") %>%
+  select(-classification) %>%
+  write.csv(., file = file.path(path_sourcedata, "source_data_figure_3h.csv"),
+            row.names = FALSE)
+```
+
+```{r, echo=FALSE, eval=FALSE, include=FALSE}
+ggsave(filename = "highspeed_plot_decoding_sequence_step_size.pdf",
+       plot = last_plot(), device = cairo_pdf, path = path_figures, scale = 1,
+       dpi = "retina", width = 5, height = 3)
+```
+
+```{r, fig.width = 10, fig.height = 4}
+plot_grid(fig_seq_pos_period, fig_seq_step, labels = "auto",
+          ncol = 2, label_fontface = "bold", rel_widths = c(5, 6))
+```
+
+
+```{r, echo=FALSE, eval=FALSE, include=FALSE}
+ggsave(filename = "highspeed_plot_decoding_sequence_between_tr.pdf",
+       plot = last_plot(), device = cairo_pdf, path = path_figures, scale = 1,
+       dpi = "retina", width = 10, height = 4)
+```
+
+```{r}
+plot_grid(fig_seq_cor_time, fig_seq_cor_period, fig_seq_step_time, fig_seq_step_period,
+          labels = "auto", ncol = 2, nrow = 2, label_fontface = "bold")
+```
+
+```{r, echo=FALSE, eval=FALSE, include=FALSE}
+ggsave(filename = "highspeed_plot_decoding_sequence_correlation_step.pdf",
+       plot = last_plot(), device = cairo_pdf, path = path_figures, scale = 1,
+       dpi = "retina", width = 10, height = 7)
+ggsave(filename = "wittkuhn_schuck_figure_s5.pdf",
+       plot = last_plot(), device = cairo_pdf, path = path_figures, scale = 1,
+       dpi = "retina", width = 10, height = 7)
+```
+
+#### Source Data File Fig. 3f
+
+```{r}
+seq_test_time(data = dt_pred_seq_cor, variable = "mean_slope") %>%
+  filter(pvalue_adjust < 0.05 & classification == "ovr") %>%
+  rmarkdown::paged_table(.)
+
+seq_test_time(data = dt_pred_seq_cor, variable = "mean_cor") %>%
+  filter(pvalue_adjust < 0.05 & classification == "ovr") %>%
+  rmarkdown::paged_table(.)
+
+seq_test_time(data = dt_pred_seq_cor, variable = "mean_step") %>%
+  filter(pvalue_adjust < 0.05 & classification == "ovr") %>%
+  rmarkdown::paged_table(.)
+```
+
+#### Figure S6
+
+```{r}
+fig_seq_slope_time_facet = plot_seq_cor_facet(dt = subset(
+  seq_test_time(data = dt_pred_seq_cor, variable = "mean_slope"),
+  classification == "ovr"), variable = "mean_slope")
+
+fig_seq_cor_time_facet = plot_seq_cor_facet(dt = subset(
+  seq_test_time(data = dt_pred_seq_cor, variable = "mean_cor"),
+  classification == "ovr"), variable = "mean_cor")
+
+fig_seq_step_time_facet = plot_seq_cor_facet(dt = subset(
+  seq_test_time(data = dt_pred_seq_cor, variable = "mean_step"),
+  classification == "ovr"), variable = "mean_step")
+
+remove_xaxis = theme(axis.title.x = element_blank())
+remove_facets = theme(strip.background = element_blank(), strip.text.x = element_blank())
+
+plot_grid(fig_seq_slope_time_facet + remove_xaxis,
+          fig_seq_pos_time_facet  + remove_xaxis + theme(legend.position = "none") + remove_facets,
+          fig_seq_cor_time_facet + remove_xaxis + theme(legend.position = "none") + remove_facets,
+          fig_seq_step_time_facet + theme(legend.position = "none") + remove_facets,
+  labels = "auto", ncol = 1, label_fontface = "bold")
+```
+
+```{r, echo=FALSE, eval=FALSE, include=FALSE}
+ggsave(filename = "highspeed_plot_decoding_sequence_timecourse_slope_correlation_step.pdf",
+       plot = last_plot(), device = cairo_pdf, path = path_figures, scale = 1,
+       dpi = "retina", width = 7, height = 9)
+```
+
+```{r}
+ggsave(filename = "wittkuhn_schuck_figure_s6.pdf",
+       plot = last_plot(), device = cairo_pdf, path = path_figures, scale = 1,
+       dpi = "retina", width = 7, height = 9)
+```
+
+#### Source Data File Fig. S6a
+
+```{r}
+subset(seq_test_time(data = dt_pred_seq_cor, variable = "mean_slope"),
+  classification == "ovr") %>%
+  select(-classification, -num_subs, -num_comp) %>%
+  write.csv(., file = file.path(path_sourcedata, "source_data_figure_s6a.csv"),
+            row.names = FALSE)
+```
+
+#### Source Data File Fig. S6b
+
+```{r}
+subset(dt_pred_seq_pos_tr, classification == "ovr")  %>%
+  select(-classification, -num_subs, -num_comp) %>%
+  write.csv(., file = file.path(path_sourcedata, "source_data_figure_s6b.csv"),
+            row.names = FALSE)
+```
+
+#### Source Data File Fig. S6c
+
+```{r}
+subset(seq_test_time(data = dt_pred_seq_cor, variable = "mean_cor"),
+  classification == "ovr") %>%
+  select(-classification, -num_subs, -num_comp) %>%
+  write.csv(., file = file.path(path_sourcedata, "source_data_figure_s6c.csv"),
+            row.names = FALSE)
+```
+
+#### Source Data File Fig. S6d
+
+```{r}
+subset(seq_test_time(data = dt_pred_seq_cor, variable = "mean_step"),
+  classification == "ovr") %>%
+  select(-classification, -num_subs, -num_comp) %>%
+  write.csv(., file = file.path(path_sourcedata, "source_data_figure_s6d.csv"),
+            row.names = FALSE)
+```
+
+### Figure 3
+
+Plot Figure 3 in the main text:
+
+```{r}
+plot_grid(
+  plot_grid(fig_seq_probas, labels = c("a"), nrow = 1),
+  plot_grid(fig_seq_slope_time, fig_seq_slope_period, labels = c("b", "c"),
+  ncol = 2, nrow = 1, label_fontface = "bold", rel_widths = c(4.9, 5)),
+  plot_grid(fig_seq_cor_between, fig_seq_cor_within, fig_seq_pos_time,
+            labels = c("d", "e", "f"), ncol = 3, rel_widths = c(0.325, 0.325, 0.35)),
+  plot_grid(fig_seq_pos_period, fig_seq_step, labels = c("g", "h"),
+  ncol = 2, label_fontface = "bold", nrow = 1),
+  nrow = 4, label_fontface = "bold", rel_heights = c(2, 3)
+  )
+```
+
+```{r, echo=FALSE, eval=FALSE, include=FALSE}
+ggsave(filename = "highspeed_plot_decoding_sequence_data.pdf",
+       plot = last_plot(), device = cairo_pdf, path = path_figures, scale = 1,
+       dpi = "retina", width = 10, height = 12)
+```
+
+```{r}
+ggsave(filename = "wittkuhn_schuck_figure_3.pdf",
+       plot = last_plot(), device = cairo_pdf, path = path_figures, scale = 1,
+       dpi = "retina", width = 10, height = 12)
+```
+
+#### Figure S7
+
+```{r, include=FALSE, echo=TRUE, eval=FALSE, warning=FALSE, message=FALSE}
+title_nomax = ggdraw() + draw_label("Sequence item with highest probability removed", fontface = "plain")
+title_nofirst = ggdraw() + draw_label("First sequence item removed", fontface = "plain")
+title_nolast = ggdraw() + draw_label("Last sequence item removed", fontface = "plain")
+# create a common legend used for the entire figure panel:
+common_legend <- get_legend(fig_seq_slope_time + theme(legend.position = "top"))
+# create the plot of sequence data with the maximum probability removed:
+plot_nomax = plot_grid(fig_seq_slope_time + theme(legend.position = "none"),
+                       fig_seq_slope_period + theme(legend.position = "none"),
+                       rel_widths = c(4, 5), labels = "auto", ncol = 2, nrow = 1,
+                       label_fontface = "bold")
+plot_nofirst = plot_grid(fig_seq_slope_time + theme(legend.position = "none"),
+                       fig_seq_slope_period + theme(legend.position = "none"),
+                       rel_widths = c(4, 5), labels = c("c", "d"), ncol = 2, nrow = 1,
+                       label_fontface = "bold")
+plot_nolast = plot_grid(fig_seq_slope_time + theme(legend.position = "none"),
+                       fig_seq_slope_period + theme(legend.position = "none"),
+                       rel_widths = c(4, 5), labels = c("e", "f"), ncol = 2, nrow = 1,
+                       label_fontface = "bold")
+plot_all = plot_grid(
+  common_legend, title_nomax, plot_nomax,
+  title_nofirst, plot_nofirst,
+  title_nolast, plot_nolast,
+  ncol = 1, rel_heights=c(0.1, 0.1, 1, 0.1, 1, 0.1, 1))
+plot_all
+```
+
+```{r, echo=FALSE, eval=FALSE, include=FALSE}
+ggsave(filename = "highspeed_plot_decoding_sequence_slope_remove_items.pdf",
+       plot = last_plot(), device = cairo_pdf, path = path_figures, scale = 1,
+       dpi = "retina", width = 10, height = 10)
+ggsave(filename = "wittkuhn_schuck_figure_s7.pdf",
+       plot = last_plot(), device = cairo_pdf, path = path_figures, scale = 1,
+       dpi = "retina", width = 10, height = 10)
+```
+ 
+
+
