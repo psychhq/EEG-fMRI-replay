@@ -1,0 +1,16 @@
+# highspeed parameters
+
+info:
+  experimenter: lennart wittkuhn
+  institution: max planck institute for human development
+  project: highspeed
+task:
+  num_trial_odd: 600
+  num_trial_seq: 75
+  num_trial_rep: 45
+mri:
+  tr: 1.25
+  thresh: 3
+  num_sessions: 2
+  num_runs: 8
+  num_trigger: 5
