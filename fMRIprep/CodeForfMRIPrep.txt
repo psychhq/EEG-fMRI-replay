@@ -1,0 +1,39 @@
+Windows:
+fmriprep-docker  F:\EEG_fMRIreplay\fMRIreplay\BIDSdata  F:\EEG_fMRIreplay\fMRIreplay\BIDSdata\derivatives  --participant-label 003 --skip_bids_validation --fs-license-file F:\EEG_fMRIreplay\fMRIreplay\license.txt
+
+
+Linux:
+/home/liulab/anaconda3/envs/huangqi_fmriprep/bin/fmriprep-docker /home/user01/fMRIreplay_hq/fmrireplay-bids/BIDS  /home/user01/fMRIreplay_hq/fmrireplay-bids/BIDS/derivatives participant --participant-label 06 --fs-license-file /home/user01/fMRIreplay_hq/fmrireplay-code/fMRIprep/license.txt --nthreads 40
+
+/home/liulab/anaconda3/envs/huangqi_fmriprep/bin/fmriprep-docker /home/user01/fMRIreplay_hq/fmrireplay-bids/BIDS  /home/user01/fMRIreplay_hq/fmrireplay-bids/BIDS/derivatives participant --participant-label 04 05 06 07 --fs-license-file /home/user01/fMRIreplay_hq/fmrireplay-code/fMRIprep/license.txt --mem_mb 35000 --nthreads 8 --omp-nthreads 8 --write-graph --stop-on-first-crash --output-space T1w fsnative template fsaverage --notrack --verbose --resource-monitor
+
+
+
+/home/liulab/anaconda3/envs/huangqi_fmriprep/bin/fmriprep-docker /home/user01/fMRIreplay_hq/fmrireplay-bids/BIDS  /home/user01/fMRIreplay_hq/fmrireplay-bids/BIDS/derivatives/fmrireplay-fmriprep participant --participant-label 40 --fs-license-file /home/user01/fMRIreplay_hq/fmrireplay-bids/BIDS/code/fMRIprep/license.txt --mem_mb 80000 --nthreads 20 --omp-nthreads 20 --output-spaces T1w fsnative fsaverage
+
+
+
+
+sudo docker run nipreps/fmriprep:20.2.7 /home/huangqi/fmrireplay/bids-nofieldmap /home/huangqi/fmrireplay/BIDS-nofieldmap/derivatives/fmrireplay-fmriprep participant --participant-label 02 --fs-license-file /home/huangqi/fmrireplay/BIDS-nofieldmap/code/fMRIprep/license.txt --mem_mb 20000 --nthreads 20 --omp-nthreads 20 --output-spaces MNI152NLin2009cAsym
+
+
+
+sudo docker run -ti --rm \
+-v /home/huangqi/fmrireplay/BIDS-nofieldmap:/data:ro \
+-v /home/huangqi/fmrireplay/BIDS-nofieldmap/derivatives/fmrireplay-fmriprep:/out \
+-v /home/huangqi/fmrireplay/BIDS-nofieldmap/code/fMRIprep/license.txt:/opt/freesurfer/license.txt \
+nipreps/fmriprep:20.2.7 \
+/data /out \
+participant \
+--participant-label 31 \
+--mem_mb 20000 \
+--nthreads 20 \
+--omp-nthreads 20 \
+--output-spaces MNI152NLin2009cAsym T1w fsnative fsaverage 
+
+25 already run
+
+
+sudo /home/huangqi/anaconda3/envs/decoding/bin/fmriprep-docker /home/huangqi/Data/BIDS /home/huangqi/Data/fmrireplay-fmriprep-new participant --participant-label 44 --fs-license-file /home/huangqi/Data/BIDS/code/fMRIprep/license.txt --mem_mb 20000 --nthreads 16 --omp-nthreads 16 --output-spaces MNI152NLin2009cAsym T1w fsnative fsaverage
+
+

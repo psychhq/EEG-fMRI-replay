@@ -1,0 +1,9 @@
+docker run -it --rm -v <bids_dir>:/data:ro -v <output_dir>:/out nipreps/mriqc:latest /data /out participant --participant_label 001 002 003
+
+
+docker run -it --rm -v /home/user01/fMRIreplay_hq/fmrireplay-bids/BIDS  -v /home/user01/fMRIreplay_hq/fmrireplay-bids/BIDS/derivatives/fmrireplay-fMRIQC/sub-01 nipreps/mriqc:latest participant --participant_label 01 
+
+
+
+docker run -it --rm -v /home/user01/fMRIreplay_hq/fmrireplay-bids/BIDS:/data:ro -v /home/user01/fMRIreplay_hq/fmrireplay-bids/BIDS/derivatives/fmrireplay-fMRIQC/sub-30:/out nipreps/mriqc:latest /data /out participant --participant_label 30 --species human --no-sub --mem_gb 80 --nprocs 20 --omp-nthreads 20
+

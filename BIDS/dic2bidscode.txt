@@ -1,0 +1,13 @@
+pip install dcm2bids --user
+conda install -c conda-forge dcm2niix
+
+dcm2bids_helper -d $HOME/fMRIreplay_hq/fmrireplay-bids/BIDS/sourcedata/fmri2/sub-40 -o $HOME/fMRIreplay_hq/fmrireplay-bids/sourcecode/bids_helper/sub-40
+
+dcm2bids_scaffold -o F:\EEG_fMRIreplay\fMRIreplay\sub-03
+
+dcm2bids_helper
+
+dcm2bids -d /home/huangqi/fmrireplay/BIDS-nofieldmap/sourcedata/fmrireplay-rawfmri/sub-31 -p 31 -c /home/huangqi/fmrireplay/BIDS-nofieldmap/code/BIDS/post-experiment/config_sub-31.json -o //home/huangqi/fmrireplay/BIDS-nofieldmap --forceDcm2niix
+
+
+
